@@ -33,7 +33,7 @@
     "commands": [
       {
         "command": "reviewComments.submitComment",
-        "title": "Review Comments: Send to AI"
+        "title": "Send comment"
       }
     ],
     "menus": {

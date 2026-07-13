@@ -7,6 +7,8 @@ const CONTROLLER_ID = 'reviewComments';
 const CONTROLLER_LABEL = 'AI Review Comments';
 const OLLAMA_URL = 'http://127.0.0.1:11434/api/chat';
 const OLLAMA_MODEL = 'qwen2.5-coder:7b';
+let previewPanel;
+let previewEntries = [];
 
 function activate(context) {
   const outputChannel = vscode.window.createOutputChannel('AI Review Comments');
@@ -95,11 +97,12 @@ async function handleSubmit(reply, outputChannel) {
     console.log(message);
     outputChannel.appendLine(message);
 
-    const panel = showSubmissionPreview(payload, ollamaSettings);
+    const entry = createPreviewEntry(payload, ollamaSettings);
+    const panel = showSubmissionPreview();
     let review = '';
 
     try {
-      review = await getOllamaReview(payload, outputChannel, ollamaSettings, panel);
+      review = await getOllamaReview(payload, outputChannel, ollamaSettings, panel, entry.id);
     } catch (error) {
       const message = `[review-comments] Ollama review failed: ${error.message}`;
       console.error(message);
@@ -107,8 +110,12 @@ async function handleSubmit(reply, outputChannel) {
       review = message;
     }
 
+    entry.review = review;
+    renderPreviewPanel();
+
     panel.webview.postMessage({
       type: 'review-final',
+      id: entry.id,
       review
     });
   } catch (error) {
@@ -119,26 +126,71 @@ async function handleSubmit(reply, outputChannel) {
   }
 }
 
-function showSubmissionPreview(payload, ollamaSettings) {
-  const panel = vscode.window.createWebviewPanel(
-    'reviewCommentsPreview',
-    'AI Review Result',
-    vscode.ViewColumn.Beside,
-    {
-      enableScripts: true,
-      retainContextWhenHidden: true
-    }
-  );
-  const nonce = crypto.randomBytes(16).toString('base64');
-  const taskText = payload.commentText || 'Review this code.';
+function createPreviewEntry(payload, ollamaSettings) {
+  const selectedLine = payload.surroundingContext?.selected?.[0] ?? '';
+  const selectedLineText = selectedLine.replace(/^\d+:\s*/, '');
 
-  panel.webview.html = `<!doctype html>
+  const entry = {
+    id: crypto.randomUUID(),
+    question: payload.commentText || 'Review this code.',
+    lineNumber: payload.range?.startLine ?? 1,
+    lineText: selectedLineText || '(no selected line)',
+    model: ollamaSettings.model,
+    review: 'Waiting for Ollama...'
+  };
+
+  previewEntries.push(entry);
+  return entry;
+}
+
+function showSubmissionPreview() {
+  if (!previewPanel) {
+    previewPanel = vscode.window.createWebviewPanel(
+      'reviewCommentsPreview',
+      'AI Review Result',
+      vscode.ViewColumn.Beside,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true
+      }
+    );
+
+    previewPanel.onDidDispose(() => {
+      previewPanel = undefined;
+      previewEntries = [];
+    });
+  } else {
+    previewPanel.reveal(vscode.ViewColumn.Beside);
+  }
+
+  renderPreviewPanel();
+
+  return previewPanel;
+}
+
+function renderPreviewPanel() {
+  if (!previewPanel) {
+    return;
+  }
+
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const entriesHtml = previewEntries.map(entry => `
+    <div class="section card">
+      <h1>Ollama Response</h1>
+      <p>Model: ${escapeHtml(entry.model)}</p>
+      <p>Question: ${escapeHtml(entry.question)}</p>
+      <p>Line ${entry.lineNumber}: ${escapeHtml(entry.lineText)}</p>
+      <pre class="live" id="review-output-${escapeHtml(entry.id)}">${escapeHtml(entry.review)}</pre>
+    </div>
+  `).join('\n');
+
+  previewPanel.webview.html = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AI Review Submission</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${panel.webview.cspSource}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${previewPanel.webview.cspSource}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
   <style>
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -168,23 +220,38 @@ function showSubmissionPreview(payload, ollamaSettings) {
     .section {
       margin-bottom: 20px;
     }
+    .card {
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      border-radius: 14px;
+      padding: 16px;
+      background: rgba(15, 23, 42, 0.72);
+    }
     .live {
       min-height: 80px;
     }
   </style>
 </head>
 <body>
-  <div class="section">
-    <h1>Ollama Response</h1>
-    <p>Model: ${escapeHtml(ollamaSettings.model)}</p>
-    <p>Task: ${escapeHtml(taskText)}</p>
-    <pre class="live" id="review-output">Waiting for Ollama...</pre>
-  </div>
+  ${entriesHtml || '<div class="section"><h1>Ollama Response</h1><p>No submissions yet.</p></div>'}
   <script nonce="${nonce}">
-    const reviewOutput = document.getElementById('review-output');
+    const outputById = new Map();
+
+    function getOutputElement(id) {
+      if (!outputById.has(id)) {
+        outputById.set(id, document.getElementById('review-output-' + id));
+      }
+
+      return outputById.get(id);
+    }
+
     window.addEventListener('message', event => {
       const message = event.data;
       if (!message || message.type === undefined) {
+        return;
+      }
+
+      const reviewOutput = getOutputElement(message.id);
+      if (!reviewOutput) {
         return;
       }
 
@@ -199,11 +266,9 @@ function showSubmissionPreview(payload, ollamaSettings) {
   </script>
 </body>
 </html>`;
-
-  return panel;
 }
 
-async function getOllamaReview(payload, outputChannel, ollamaSettings, panel) {
+async function getOllamaReview(payload, outputChannel, ollamaSettings, panel, entryId) {
   if (typeof fetch !== 'function') {
     throw new Error('Fetch is not available in this VS Code runtime.');
   }
@@ -245,10 +310,10 @@ async function getOllamaReview(payload, outputChannel, ollamaSettings, panel) {
     throw new Error(`Ollama request failed (${response.status}): ${errorText}`);
   }
 
-  return readOllamaStream(response, panel);
+  return readOllamaStream(response, panel, entryId);
 }
 
-async function readOllamaStream(response, panel) {
+async function readOllamaStream(response, panel, entryId) {
   if (!response.body || typeof response.body.getReader !== 'function') {
     const data = await response.json();
     return data?.message?.content ?? '';
@@ -286,6 +351,7 @@ async function readOllamaStream(response, panel) {
       review += chunk;
       panel.webview.postMessage({
         type: 'review-chunk',
+        id: entryId,
         chunk
       });
     }
@@ -298,6 +364,7 @@ async function readOllamaStream(response, panel) {
       review += chunk;
       panel.webview.postMessage({
         type: 'review-chunk',
+        id: entryId,
         chunk
       });
     }

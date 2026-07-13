@@ -34,7 +34,7 @@ PReview AI Comments is a VS Code extension that sends a comment-thread selection
 1. Open a file in VS Code.
 2. Create or open a comment thread on a line of code.
 3. Add a comment such as `explain this function` or a review request.
-4. Click `Review Comments: Send to AI` from the thread actions.
+4. Click `Send comment` from the thread actions.
 5. Wait for the `AI Review Result` panel to appear.
 
 If your comment text includes `explain`, the extension asks Ollama to explain the selected code in plain language. Otherwise, it asks for concise review feedback.
