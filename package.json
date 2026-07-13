@@ -1,0 +1,60 @@
+{
+  "name": "preview-ai-comments",
+  "displayName": "PReview AI Comments",
+  "description": "Line-level review comments in VS Code, routed to an AI responder.",
+  "version": "0.0.1",
+  "publisher": "sakibhossain",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "configuration": {
+    "title": "PReview AI Comments",
+    "properties": {
+      "reviewComments.ollamaUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:11434/api/chat",
+        "description": "Ollama chat endpoint used to review submitted comments."
+      },
+      "reviewComments.ollamaModel": {
+        "type": "string",
+        "default": "qwen2.5-coder:7b",
+        "description": "Ollama model used to review submitted comments."
+      }
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "reviewComments.submitComment",
+        "title": "Review Comments: Send to AI"
+      }
+    ],
+    "menus": {
+      "comments/commentThread/title": [
+        {
+          "command": "reviewComments.submitComment",
+          "group": "inline"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "reviewComments.submitComment",
+          "group": "inline"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "lint": "node --check extension.js"
+  },
+  "devDependencies": {
+    "vscode": "^1.1.37"
+  }
+}
