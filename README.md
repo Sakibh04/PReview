@@ -72,4 +72,10 @@ Lint the main file with:
 npm run lint
 ```
 
+Run the unit tests (Node 18+, no dependencies):
+
+```bash
+npm test
+```
+
 The extension entrypoint is [extension.js](extension.js), and the manifest is [package.json](package.json).

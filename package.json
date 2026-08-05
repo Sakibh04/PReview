@@ -52,7 +52,8 @@
     }
   },
   "scripts": {
-    "lint": "node --check extension.js"
+    "lint": "node --check extension.js",
+    "test": "node --test"
   },
   "devDependencies": {
     "vscode": "^1.1.37"
