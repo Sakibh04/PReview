@@ -8,6 +8,7 @@ const CONTROLLER_LABEL = 'AI Review Comments';
 const OLLAMA_URL = 'http://127.0.0.1:11434/api/chat';
 const OLLAMA_MODEL = 'qwen2.5-coder:7b';
 const REQUEST_TIMEOUT_MS = 120000;
+const HEALTH_CHECK_TIMEOUT_MS = 5000;
 const MAX_REVIEW_CONTEXT = 6000;
 const MAX_PAYLOAD_CONTEXT = 12000;
 
@@ -16,6 +17,7 @@ let previewEntries = [];
 let webviewReady = false;
 let resolveWebviewReady = null;
 const activeRequests = new Set();
+const activeRequestsByKey = new Map();
 
 function activate(context) {
   const outputChannel = vscode.window.createOutputChannel('AI Review Comments');
@@ -112,33 +114,37 @@ async function handleSubmit(reply, outputChannel) {
       outputChannel.appendLine(`[review-comments] webview ready (fallback=${!webviewReady}), starting request`);
     }
 
-    let review = '';
-
-    try {
-      review = await getOllamaReview(payload, outputChannel, ollamaSettings, panel, entry.id);
-      entry.status = 'done';
-    } catch (error) {
-      const message = `[review-comments] Ollama review failed: ${formatOllamaError(error, ollamaSettings.url)}`;
-      console.error(message);
-      outputChannel.appendLine(message);
-      review = message;
-      entry.status = 'error';
-    }
-
-    entry.review = review;
-    renderPreviewPanel();
-    postToPanel(panel, {
-      type: 'review-final',
-      id: entry.id,
-      review,
-      status: entry.status
-    });
+    await runReview(entry, outputChannel, panel);
   } catch (error) {
     const message = `[review-comments] submit failed: ${error.message}`;
     console.error(message);
     outputChannel.appendLine(message);
     vscode.window.showErrorMessage('Review Comments: submission failed');
   }
+}
+
+async function runReview(entry, outputChannel, panel) {
+  entry.status = 'pending';
+  entry.review = '';
+  postToPanel(panel, { type: 'entry-updated', id: entry.id, html: renderEntryHtml(entry) });
+
+  try {
+    await checkOllamaAvailability(entry.settings.url, entry.settings.model, entry.id);
+    entry.review = await getOllamaReview(entry.payload, outputChannel, entry.settings, panel, entry.id);
+    entry.status = 'done';
+  } catch (error) {
+    const message = `[review-comments] Ollama review failed: ${error.message}`;
+    console.error(message);
+    outputChannel.appendLine(message);
+    entry.review = message;
+    entry.status = 'error';
+  }
+
+  postToPanel(panel, {
+    type: 'entry-updated',
+    id: entry.id,
+    html: renderEntryHtml(entry)
+  });
 }
 
 function createPreviewEntry(payload, ollamaSettings) {
@@ -152,6 +158,7 @@ function createPreviewEntry(payload, ollamaSettings) {
     lineNumber: payload.range?.startLine ?? 1,
     lineText: selectedLineText || '(no selected line)',
     model: ollamaSettings.model,
+    settings: ollamaSettings,
     review: '',
     status: 'pending',
     composerText: '',
@@ -422,6 +429,9 @@ function renderPreviewPanel() {
     .copy-btn:hover:not(:disabled) { color: var(--signal); border-color: var(--signal); }
     .copy-btn.copied { color: var(--signal); border-color: var(--signal); }
     .copy-btn:disabled { color: var(--faint); border-color: var(--line); cursor: default; }
+    .action-btn { margin-left: 6px; }
+    .retry-btn { color: var(--signal); border-color: rgba(198, 255, 74, .45); }
+    .cancel-btn { color: #ffb74d; border-color: rgba(255, 183, 77, .45); }
     .review-output.error, .follow-up-output.error { color: var(--danger); border-color: rgba(255, 107, 107, .45); }
     @media (max-width: 560px) {
       #entries { padding: 12px; }
@@ -539,6 +549,14 @@ function renderPreviewPanel() {
       button.disabled = pendingEntries.has(entryId) || input.value.trim() === '';
     }
 
+    function updateSubmissionCount() {
+      const count = document.querySelector('.shell-count');
+      const total = document.querySelectorAll('.card').length;
+      if (count) {
+        count.textContent = total + (total === 1 ? ' submission' : ' submissions');
+      }
+    }
+
     function ensureFollowUpItem(entryId, followUpId, prompt) {
       const container = document.getElementById('follow-up-list-' + entryId);
 
@@ -559,11 +577,10 @@ function renderPreviewPanel() {
       statusNode.textContent = statusLabel('pending');
 
       const copyNode = document.createElement('button');
-      copyNode.className = 'copy-btn';
-      copyNode.disabled = true;
-      copyNode.dataset.copyEntry = entryId;
-      copyNode.dataset.copyFollowUp = followUpId;
-      copyNode.textContent = 'Copy';
+      copyNode.className = 'copy-btn action-btn cancel-btn';
+      copyNode.dataset.entryId = entryId;
+      copyNode.dataset.followUpId = followUpId;
+      copyNode.textContent = 'Cancel';
 
       header.appendChild(statusNode);
       header.appendChild(copyNode);
@@ -674,6 +691,22 @@ function renderPreviewPanel() {
         return;
       }
 
+      const retryButton = event.target.closest('.retry-btn');
+      if (retryButton && retryButton.dataset.entryId) {
+        vscode.postMessage({ type: 'retry-review', entryId: retryButton.dataset.entryId });
+        return;
+      }
+
+      const cancelButton = event.target.closest('.cancel-btn');
+      if (cancelButton && cancelButton.dataset.entryId) {
+        vscode.postMessage({
+          type: cancelButton.dataset.followUpId ? 'cancel-follow-up' : 'cancel-review',
+          entryId: cancelButton.dataset.entryId,
+          followUpId: cancelButton.dataset.followUpId
+        });
+        return;
+      }
+
       const copyButton = event.target.closest('.copy-btn');
       if (copyButton) {
         vscode.postMessage({
@@ -698,6 +731,27 @@ function renderPreviewPanel() {
             emptyState.remove();
           }
           container.insertAdjacentHTML('beforeend', message.html);
+          updateSubmissionCount();
+        }
+      }
+
+      if (message.type === 'entry-updated') {
+        const current = document.querySelector('[data-entry-id="' + message.id + '"]');
+        if (current) {
+          const input = current.querySelector('.follow-up-input');
+          const hadFocus = document.activeElement === input;
+          const value = input ? input.value : '';
+          current.outerHTML = message.html;
+          const replacement = document.getElementById('follow-up-input-' + message.id);
+          if (replacement && value && !replacement.value) {
+            replacement.value = value;
+          }
+          if (hadFocus && replacement) {
+            replacement.focus();
+            replacement.selectionStart = replacement.selectionEnd = replacement.value.length;
+          }
+          pendingEntries.delete(message.id);
+          updateSendButton(message.id);
         }
       }
 
@@ -806,7 +860,11 @@ function renderEntryHtml(entry) {
         </div>
         <div>
           <span class="status status-${escapeHtml(status)}" id="status-${escapeHtml(entry.id)}">${escapeHtml(statusLabel(status))}</span>
-          <button class="copy-btn" data-copy-entry="${escapeHtml(entry.id)}" ${inFlight ? 'disabled' : ''}>Copy answer</button>
+          ${inFlight
+            ? `<button class="copy-btn action-btn cancel-btn" data-entry-id="${escapeHtml(entry.id)}">Cancel</button>`
+            : status === 'error'
+              ? `<button class="copy-btn action-btn retry-btn" data-entry-id="${escapeHtml(entry.id)}">Retry</button>`
+              : `<button class="copy-btn action-btn" data-copy-entry="${escapeHtml(entry.id)}">Copy answer</button>`}
         </div>
       </div>
       <div class="source-strip">
@@ -840,7 +898,9 @@ function renderFollowUpHtml(entryId, followUp) {
     <div class="follow-up-item" id="follow-up-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">
       <div class="follow-up-item-header">
         <span class="status status-${escapeHtml(status)}" id="fu-status-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">${escapeHtml(statusLabel(status))}</span>
-        <button class="copy-btn" data-copy-entry="${escapeHtml(entryId)}" data-copy-follow-up="${escapeHtml(followUp.id)}" ${inFlight ? 'disabled' : ''}>Copy answer</button>
+        ${inFlight
+          ? `<button class="copy-btn action-btn cancel-btn" data-entry-id="${escapeHtml(entryId)}" data-follow-up-id="${escapeHtml(followUp.id)}">Cancel</button>`
+          : `<button class="copy-btn action-btn" data-copy-entry="${escapeHtml(entryId)}" data-copy-follow-up="${escapeHtml(followUp.id)}">Copy answer</button>`}
       </div>
       <p class="follow-up-prompt"><strong>Follow-up:</strong> ${escapeHtml(followUp.prompt)}</p>
       <pre class="follow-up-output${status === 'error' ? ' error' : ''}" id="follow-up-output-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">${escapeHtml(followUp.review)}</pre>
@@ -863,6 +923,24 @@ async function handleWebviewMessage(message, outputChannel) {
     if (entry) {
       entry.composerText = typeof message.value === 'string' ? message.value : '';
     }
+    return;
+  }
+
+  if (message.type === 'retry-review') {
+    const entry = previewEntries.find(item => item.id === message.entryId);
+    if (entry && entry.status === 'error') {
+      await runReview(entry, outputChannel, previewPanel);
+    }
+    return;
+  }
+
+  if (message.type === 'cancel-review') {
+    abortRequest(message.entryId);
+    return;
+  }
+
+  if (message.type === 'cancel-follow-up') {
+    abortRequest(`follow-up:${message.entryId}:${message.followUpId}`);
     return;
   }
 
@@ -911,34 +989,32 @@ async function handleFollowUp(entryId, prompt, outputChannel) {
       prompt
     });
 
+    followUp.requestKey = `follow-up:${entryId}:${followUp.id}`;
     const review = await getOllamaFollowUpReview(entry, prompt, outputChannel, followUp.id);
     followUp.review = review;
     followUp.status = 'done';
 
-    renderPreviewPanel();
     postToPanel(previewPanel, {
-      type: 'follow-up-final',
-      entryId,
-      followUpId: followUp.id,
-      review,
-      status: followUp.status
+      type: 'entry-updated',
+      id: entry.id,
+      html: renderEntryHtml(entry)
     });
   } catch (error) {
-    const message = `[review-comments] follow-up failed: ${formatOllamaError(error, getOllamaSettings().url)}`;
+    const message = `[review-comments] follow-up failed: ${error.message}`;
     console.error(message);
     outputChannel.appendLine(message);
     const latestFollowUp = previewEntries.find(item => item.id === entryId)?.followUps.slice(-1)[0];
     if (latestFollowUp) {
       latestFollowUp.status = 'error';
     }
-    renderPreviewPanel();
-    postToPanel(previewPanel, {
-      type: 'follow-up-final',
-      entryId,
-      followUpId: latestFollowUp?.id,
-      review: message,
-      status: 'error'
-    });
+    const entry = previewEntries.find(item => item.id === entryId);
+    if (entry) {
+      postToPanel(previewPanel, {
+        type: 'entry-updated',
+        id: entry.id,
+        html: renderEntryHtml(entry)
+      });
+    }
   }
 }
 
@@ -948,7 +1024,7 @@ async function getOllamaReview(payload, outputChannel, ollamaSettings, panel, en
   }
 
   const requestBody = buildOllamaRequestBody(payload, ollamaSettings.model);
-  const request = createRequestSignal(REQUEST_TIMEOUT_MS);
+  const request = createRequestSignal(REQUEST_TIMEOUT_MS, entryId);
 
   outputChannel.appendLine(`[review-comments] sending request to Ollama model ${ollamaSettings.model}`);
 
@@ -989,7 +1065,7 @@ async function getOllamaFollowUpReview(entry, prompt, outputChannel, followUpId)
 
   const ollamaSettings = getOllamaSettings();
   const requestBody = buildFollowUpRequestBody(entry, prompt, ollamaSettings.model);
-  const request = createRequestSignal(REQUEST_TIMEOUT_MS);
+  const request = createRequestSignal(REQUEST_TIMEOUT_MS, `follow-up:${entry.id}:${followUpId}`);
 
   outputChannel.appendLine(`[review-comments] sending follow-up request to Ollama model ${ollamaSettings.model}`);
 
@@ -1031,6 +1107,49 @@ function formatOllamaError(error, url) {
   }
 
   return message;
+}
+
+async function checkOllamaAvailability(url, model, requestKey) {
+  if (typeof fetch !== 'function') {
+    throw new Error('Fetch is not available in this VS Code runtime.');
+  }
+
+  const healthUrl = getOllamaHealthUrl(url);
+  const request = createRequestSignal(HEALTH_CHECK_TIMEOUT_MS, requestKey);
+
+  try {
+    const response = await fetch(healthUrl, {
+      method: 'GET',
+      signal: request.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ollama health check failed (${response.status})`);
+    }
+
+    const data = await response.json();
+    const models = Array.isArray(data?.models) ? data.models.map(item => item?.name).filter(Boolean) : [];
+    if (models.length > 0 && !models.includes(model)) {
+      throw new Error(`Ollama model "${model}" is not installed. Run \`ollama pull ${model}\`.`);
+    }
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`Ollama did not respond within ${HEALTH_CHECK_TIMEOUT_MS / 1000}s`);
+    }
+    throw new Error(formatOllamaError(error, url));
+  } finally {
+    request.cleanup();
+  }
+}
+
+function getOllamaHealthUrl(url) {
+  try {
+    const parsed = new URL(url);
+    parsed.pathname = parsed.pathname.replace(/\/api\/chat\/?$/, '/api/tags');
+    return parsed.toString();
+  } catch {
+    return url;
+  }
 }
 
 function buildOllamaRequestBody(payload, model) {
@@ -1188,10 +1307,13 @@ function parseOllamaLine(line) {
   }
 }
 
-function createRequestSignal(timeoutMs) {
+function createRequestSignal(timeoutMs, requestKey) {
   const controller = new AbortController();
   let didTimeout = false;
   activeRequests.add(controller);
+  if (requestKey) {
+    activeRequestsByKey.set(requestKey, controller);
+  }
 
   const timer = setTimeout(() => {
     didTimeout = true;
@@ -1204,8 +1326,18 @@ function createRequestSignal(timeoutMs) {
     cleanup() {
       clearTimeout(timer);
       activeRequests.delete(controller);
+      if (requestKey && activeRequestsByKey.get(requestKey) === controller) {
+        activeRequestsByKey.delete(requestKey);
+      }
     }
   };
+}
+
+function abortRequest(requestKey) {
+  const controller = activeRequestsByKey.get(requestKey);
+  if (controller) {
+    controller.abort();
+  }
 }
 
 function abortActiveRequests() {
@@ -1213,6 +1345,7 @@ function abortActiveRequests() {
     controller.abort();
   }
   activeRequests.clear();
+  activeRequestsByKey.clear();
 }
 
 function postToPanel(panel, message) {
