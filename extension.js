@@ -342,6 +342,19 @@ function renderPreviewPanel() {
       word-break: break-word;
       tab-size: 2;
     }
+    .context-details { border-bottom: 1px solid var(--line); }
+    .context-details summary { padding: 11px 18px; color: var(--muted); cursor: pointer; font-size: 11px; }
+    .context-details summary:hover { color: var(--signal); }
+    .context-details pre { max-height: 360px; border: 0; border-top: 1px solid var(--line); }
+    .markdown { min-height: 96px; overflow: auto; padding: 16px; border: 1px solid var(--line); background: #0b0d0a; color: var(--text); word-break: break-word; }
+    .markdown p { margin: 0 0 12px; }
+    .markdown p:last-child { margin-bottom: 0; }
+    .markdown h1, .markdown h2, .markdown h3 { margin: 0 0 10px; color: var(--signal); font-size: 13px; }
+    .markdown ul, .markdown ol { margin: 0 0 12px; padding-left: 22px; }
+    .markdown li + li { margin-top: 5px; }
+    .markdown code { padding: 1px 4px; background: var(--surface-raised); color: var(--signal); }
+    .markdown pre { margin: 10px 0 12px; min-height: 0; border-color: var(--line-strong); }
+    .markdown a { color: var(--cyan); }
     .status {
       display: inline-flex;
       align-items: center;
@@ -492,6 +505,134 @@ function renderPreviewPanel() {
       return followUpOutputById.get(key);
     }
 
+    function escapeMarkup(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function inlineMarkdown(value) {
+      return escapeMarkup(value)
+        .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
+        .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
+        .replace(/\\*([^*]+)\\*/g, '<em>$1</em>')
+        .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+    }
+
+    function renderMarkdown(value) {
+      const lines = String(value ?? '').replace(/\\r\\n/g, '\\n').split('\\n');
+      const html = [];
+      let paragraph = [];
+      let listType = '';
+      let listItems = [];
+      let codeLines = null;
+
+      function flushParagraph() {
+        if (paragraph.length) {
+          html.push('<p>' + inlineMarkdown(paragraph.join(' ')) + '</p>');
+          paragraph = [];
+        }
+      }
+
+      function flushList() {
+        if (!listItems.length) {
+          return;
+        }
+        html.push('<' + listType + '>' + listItems.map(item => '<li>' + inlineMarkdown(item) + '</li>').join('') + '</' + listType + '>');
+        listItems = [];
+        listType = '';
+      }
+
+      function flushCode() {
+        if (codeLines !== null) {
+          html.push('<pre><code>' + escapeMarkup(codeLines.join('\\n')) + '</code></pre>');
+          codeLines = null;
+        }
+      }
+
+      for (const line of lines) {
+        if (codeLines !== null) {
+          if (/^\`\`\`/.test(line)) {
+            flushCode();
+          } else {
+            codeLines.push(line);
+          }
+          continue;
+        }
+
+        if (/^\`\`\`/.test(line)) {
+          flushParagraph();
+          flushList();
+          codeLines = [];
+          continue;
+        }
+
+        const heading = line.match(/^(#{1,3})\\s+(.+)$/);
+        const bullet = line.match(/^\\s*[-*]\\s+(.+)$/);
+        const ordered = line.match(/^\\s*\\d+\\.\\s+(.+)$/);
+
+        if (!line.trim()) {
+          flushParagraph();
+          flushList();
+        } else if (heading) {
+          flushParagraph();
+          flushList();
+          const level = heading[1].length;
+          html.push('<h' + level + '>' + inlineMarkdown(heading[2]) + '</h' + level + '>');
+        } else if (bullet || ordered) {
+          flushParagraph();
+          const nextType = bullet ? 'ul' : 'ol';
+          if (listType && listType !== nextType) {
+            flushList();
+          }
+          listType = nextType;
+          listItems.push((bullet || ordered)[1]);
+        } else {
+          flushList();
+          paragraph.push(line.trim());
+        }
+      }
+
+      flushCode();
+      flushParagraph();
+      flushList();
+      return html.join('') || '<p class="muted-output">No response received.</p>';
+    }
+
+    function renderMarkdownBlock(element) {
+      if (!element) {
+        return;
+      }
+      const raw = element.dataset.raw ?? element.textContent;
+      element.dataset.raw = raw;
+      element.innerHTML = renderMarkdown(raw);
+    }
+
+    function appendMarkdown(element, chunk) {
+      if (!element) {
+        return;
+      }
+      const raw = (element.dataset.raw || '') + chunk;
+      element.dataset.raw = raw;
+      element.innerHTML = renderMarkdown(raw);
+    }
+
+    function setMarkdown(element, value, isError) {
+      if (!element) {
+        return;
+      }
+      element.dataset.raw = value || 'No response received.';
+      element.innerHTML = renderMarkdown(element.dataset.raw);
+      element.classList.toggle('error', Boolean(isError));
+    }
+
+    function renderMarkdownBlocks(root) {
+      (root || document).querySelectorAll('.markdown').forEach(renderMarkdownBlock);
+    }
+
     function statusLabel(status) {
       if (status === 'pending') {
         return 'Queued';
@@ -589,8 +730,8 @@ function renderPreviewPanel() {
       promptNode.className = 'follow-up-prompt';
       promptNode.textContent = 'Follow-up: ' + prompt;
 
-      const outputNode = document.createElement('pre');
-      outputNode.className = 'follow-up-output';
+      const outputNode = document.createElement('div');
+      outputNode.className = 'markdown follow-up-output';
       outputNode.id = 'follow-up-output-' + entryId + '-' + followUpId;
 
       item.appendChild(header);
@@ -731,6 +872,7 @@ function renderPreviewPanel() {
             emptyState.remove();
           }
           container.insertAdjacentHTML('beforeend', message.html);
+          renderMarkdownBlocks(container.lastElementChild);
           updateSubmissionCount();
         }
       }
@@ -750,6 +892,7 @@ function renderPreviewPanel() {
             replacement.focus();
             replacement.selectionStart = replacement.selectionEnd = replacement.value.length;
           }
+          renderMarkdownBlocks(current.parentElement || document);
           pendingEntries.delete(message.id);
           updateSendButton(message.id);
         }
@@ -762,7 +905,7 @@ function renderPreviewPanel() {
       if (message.type === 'review-chunk') {
         const reviewOutput = getOutputElement(message.id);
         if (reviewOutput) {
-          reviewOutput.textContent += message.chunk;
+          appendMarkdown(reviewOutput, message.chunk);
         }
         setStatus(message.id, 'streaming');
       }
@@ -770,8 +913,7 @@ function renderPreviewPanel() {
       if (message.type === 'review-final') {
         const reviewOutput = getOutputElement(message.id);
         if (reviewOutput) {
-          reviewOutput.textContent = message.review || 'No response received from Ollama.';
-          reviewOutput.classList.toggle('error', message.status === 'error');
+          setMarkdown(reviewOutput, message.review, message.status === 'error');
         }
         setStatus(message.id, message.status || 'done');
       }
@@ -787,7 +929,7 @@ function renderPreviewPanel() {
       if (message.type === 'follow-up-chunk') {
         const followUpOutput = getFollowUpOutputElement(message.entryId, message.followUpId);
         if (followUpOutput) {
-          followUpOutput.textContent += message.chunk;
+          appendMarkdown(followUpOutput, message.chunk);
         }
         setFollowUpStatus(message.entryId, message.followUpId, 'streaming');
       }
@@ -795,8 +937,7 @@ function renderPreviewPanel() {
       if (message.type === 'follow-up-final') {
         const followUpOutput = getFollowUpOutputElement(message.entryId, message.followUpId);
         if (followUpOutput) {
-          followUpOutput.textContent = message.review || 'No response received from Ollama.';
-          followUpOutput.classList.toggle('error', message.status === 'error');
+          setMarkdown(followUpOutput, message.review, message.status === 'error');
         }
         setFollowUpStatus(message.entryId, message.followUpId, message.status || 'done');
         const copyButton = document.querySelector(copySelector({
@@ -822,6 +963,8 @@ function renderPreviewPanel() {
       }
       updateSendButton(entryId);
     });
+
+    renderMarkdownBlocks();
 
     vscode.postMessage({ type: 'webview-ready' });
   </script>
@@ -850,6 +993,13 @@ function renderEntryHtml(entry) {
   const status = entry.status || 'done';
   const inFlight = status === 'pending' || status === 'streaming';
   const sendDisabled = !(entry.composerText || '').trim() ? ' disabled' : '';
+  const context = [
+    ...(entry.payload.surroundingContext?.before ?? []),
+    '--- selected ---',
+    ...(entry.payload.surroundingContext?.selected ?? []),
+    '--- after ---',
+    ...(entry.payload.surroundingContext?.after ?? [])
+  ].join('\n');
 
   return `
     <article class="section card" data-entry-id="${escapeHtml(entry.id)}">
@@ -871,9 +1021,13 @@ function renderEntryHtml(entry) {
         <div><span class="source-label">Selected line</span><span class="source-value"><strong>${escapeHtml(entry.lineNumber)}:</strong> ${escapeHtml(entry.lineText)}</span></div>
         <div><span class="source-label">Model</span><span class="source-value">${escapeHtml(entry.model)}</span></div>
       </div>
+      <details class="context-details">
+        <summary>Show code context</summary>
+        <pre>${escapeHtml(context)}</pre>
+      </details>
       <section class="answer-block" aria-label="Review answer">
         <div class="block-label"><span>Assistant answer</span><span>${escapeHtml(statusLabel(status))}</span></div>
-        <pre class="review-output${status === 'error' ? ' error' : ''}" id="review-output-${escapeHtml(entry.id)}">${escapeHtml(entry.review)}</pre>
+        <div class="markdown review-output${status === 'error' ? ' error' : ''}" id="review-output-${escapeHtml(entry.id)}">${escapeHtml(entry.review)}</div>
       </section>
       <section class="follow-up-section" aria-label="Follow-up questions">
         <div class="follow-up-list" id="follow-up-list-${escapeHtml(entry.id)}">
@@ -903,7 +1057,7 @@ function renderFollowUpHtml(entryId, followUp) {
           : `<button class="copy-btn action-btn" data-copy-entry="${escapeHtml(entryId)}" data-copy-follow-up="${escapeHtml(followUp.id)}">Copy answer</button>`}
       </div>
       <p class="follow-up-prompt"><strong>Follow-up:</strong> ${escapeHtml(followUp.prompt)}</p>
-      <pre class="follow-up-output${status === 'error' ? ' error' : ''}" id="follow-up-output-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">${escapeHtml(followUp.review)}</pre>
+      <div class="markdown follow-up-output${status === 'error' ? ' error' : ''}" id="follow-up-output-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">${escapeHtml(followUp.review)}</div>
     </div>
   `;
 }
