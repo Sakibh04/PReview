@@ -41,6 +41,10 @@ test('escapeHtml escapes all special characters', () => {
   assert.equal(ext.escapeHtml(`<a>"x"&'y'</a>`), '&lt;a&gt;&quot;x&quot;&amp;&#39;y&#39;&lt;/a&gt;');
 });
 
+test('escapeHtml accepts numeric template values', () => {
+  assert.equal(ext.escapeHtml(42), '42');
+});
+
 test('normalizeText handles plain strings', () => {
   assert.equal(ext.normalizeText('plain'), 'plain');
 });
@@ -109,4 +113,10 @@ test('truncateForModel annotates truncated text', () => {
   const result = ext.truncateForModel('x'.repeat(200), 100);
   assert.match(result, /\[truncated for model context\]/);
   assert.ok(result.length < 200);
+});
+
+test('formatOllamaError explains how to recover from a connection failure', () => {
+  const message = ext.formatOllamaError(new Error('fetch failed'), 'http://127.0.0.1:11434/api/chat');
+  assert.match(message, /Could not connect to Ollama/);
+  assert.match(message, /ollama serve/);
 });

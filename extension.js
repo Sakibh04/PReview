@@ -118,7 +118,7 @@ async function handleSubmit(reply, outputChannel) {
       review = await getOllamaReview(payload, outputChannel, ollamaSettings, panel, entry.id);
       entry.status = 'done';
     } catch (error) {
-      const message = `[review-comments] Ollama review failed: ${error.message}`;
+      const message = `[review-comments] Ollama review failed: ${formatOllamaError(error, ollamaSettings.url)}`;
       console.error(message);
       outputChannel.appendLine(message);
       review = message;
@@ -238,203 +238,207 @@ function renderPreviewPanel() {
   <title>AI Review Submission</title>
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${previewPanel.webview.cspSource}; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
   <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0c0a;
+      --surface: #11130f;
+      --surface-raised: #171a15;
+      --line: #30352d;
+      --line-strong: #4a5345;
+      --text: #e8eee4;
+      --muted: #899287;
+      --faint: #596157;
+      --signal: #c6ff4a;
+      --signal-dim: rgba(198, 255, 74, 0.12);
+      --cyan: #7dd3fc;
+      --danger: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
       margin: 0;
-      padding: 20px;
-      background: #111827;
-      color: #e5e7eb;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.55;
     }
-    h1 {
-      font-size: 18px;
-      margin: 0 0 12px;
+    button, textarea { font: inherit; }
+    button:focus-visible, textarea:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+    .shell-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 20px 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
     }
-    p {
-      margin: 0 0 16px;
-      color: #9ca3af;
+    .eyebrow {
+      margin: 0;
+      color: var(--signal);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
     }
+    .shell-title { margin: 4px 0 0; font-size: 16px; letter-spacing: -.03em; }
+    .shell-count { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    #entries { padding: 20px; max-width: 980px; margin: 0 auto; }
+    .empty-state {
+      border: 1px dashed var(--line-strong);
+      padding: 28px;
+      color: var(--muted);
+      text-align: center;
+    }
+    .empty-state h1 { margin: 0 0 6px; color: var(--text); font-size: 15px; }
+    .empty-state p { margin: 0; }
+    .section { margin-bottom: 18px; }
+    .card {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, .18);
+    }
+    .card-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+    .entry-index { color: var(--faint); font-size: 11px; }
+    .entry-title { margin: 3px 0 0; font-size: 14px; font-weight: 700; }
+    .source-strip {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px 20px;
+      padding: 13px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #0e100d;
+    }
+    .source-label { color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: .1em; }
+    .source-value { display: block; margin-top: 3px; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
+    .source-value strong { color: var(--text); font-weight: 500; }
+    .answer-block { padding: 18px; }
+    .block-label { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; color: var(--faint); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
     pre {
       margin: 0;
-      padding: 16px;
-      border-radius: 10px;
-      background: #0f172a;
-      color: #d1fae5;
+      min-height: 96px;
+      max-height: 520px;
       overflow: auto;
+      padding: 16px;
+      border: 1px solid var(--line);
+      background: #0b0d0a;
+      color: var(--text);
       white-space: pre-wrap;
       word-break: break-word;
-    }
-    .section {
-      margin-bottom: 20px;
-    }
-    .card {
-      border: 1px solid rgba(148, 163, 184, 0.18);
-      border-radius: 14px;
-      padding: 16px;
-      background: rgba(15, 23, 42, 0.72);
-    }
-    .card-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 12px;
+      tab-size: 2;
     }
     .status {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      font-size: 12px;
-      font-weight: 600;
-      padding: 3px 12px;
-      border-radius: 999px;
-      color: #cbd5e1;
-      background: rgba(100, 116, 139, 0.18);
-      border: 1px solid rgba(148, 163, 184, 0.25);
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
     }
     .status::after {
       content: '';
-      width: 6px;
-      height: 6px;
+      width: 7px;
+      height: 7px;
       border-radius: 50%;
       background: currentColor;
     }
-    .status-pending {
-      animation: pulse 1.4s ease-in-out infinite;
-    }
-    .status-pending::after {
-      background: #fbbf24;
-    }
-    .status-streaming {
-      color: #7dd3fc;
-      background: rgba(56, 189, 248, 0.12);
-      border-color: rgba(56, 189, 248, 0.35);
-    }
-    .status-streaming::after {
-      background: #38bdf8;
-      animation: blink 1s steps(2, start) infinite;
-    }
-    .status-done {
-      color: #6ee7b7;
-      background: rgba(52, 211, 153, 0.12);
-      border-color: rgba(52, 211, 153, 0.35);
-    }
-    .status-done::after {
-      background: #34d399;
-    }
-    .status-error {
-      color: #fda4af;
-      background: rgba(244, 63, 94, 0.12);
-      border-color: rgba(244, 63, 94, 0.35);
-    }
-    .status-error::after {
-      background: #fb7185;
-    }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.55; }
-    }
-    @keyframes blink {
-      0%, 49% { opacity: 1; }
-      50%, 100% { opacity: 0.15; }
-    }
+    .status-pending { color: #ffb74d; animation: pulse 1.4s ease-in-out infinite; }
+    .status-streaming { color: var(--cyan); }
+    .status-streaming::after { animation: blink 1s steps(2, start) infinite; }
+    .status-done { color: var(--signal); }
+    .status-error { color: var(--danger); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+    @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: .15; } }
+    .follow-up-section { padding: 0 18px 18px; }
     .follow-up-list {
-      margin-top: 16px;
       display: grid;
-      gap: 12px;
+      gap: 16px;
+      margin-bottom: 16px;
     }
     .follow-up-item {
-      border-top: 1px solid rgba(148, 163, 184, 0.18);
-      padding-top: 12px;
+      border-top: 1px solid var(--line);
+      padding-top: 16px;
     }
-    .follow-up-item p {
-      margin-bottom: 8px;
-    }
-    .follow-up-item-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 8px;
-    }
-    .follow-up-output {
-      min-height: 56px;
-    }
+    .follow-up-item-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+    .follow-up-prompt { margin: 0 0 8px; color: var(--muted); }
+    .follow-up-prompt strong { color: var(--text); font-weight: 500; }
+    .follow-up-output { min-height: 56px; }
+    .composer-label { margin: 0 0 7px; color: var(--faint); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
     .follow-up-composer {
-      display: flex;
-      gap: 8px;
-      align-items: stretch;
-      margin-top: 16px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
     }
     .follow-up-input {
-      flex: 1;
-      min-height: 72px;
+      width: 100%;
+      min-height: 86px;
       resize: vertical;
-      border-radius: 10px;
-      border: 1px solid rgba(148, 163, 184, 0.22);
-      background: rgba(2, 6, 23, 0.75);
-      color: #e5e7eb;
+      border: 1px solid var(--line-strong);
+      border-radius: 0;
+      background: #0b0d0a;
+      color: var(--text);
       padding: 12px;
       font: inherit;
-      box-sizing: border-box;
     }
-    .follow-up-input:focus {
-      outline: none;
-      border-color: rgba(56, 189, 248, 0.5);
-    }
+    .follow-up-input::placeholder { color: var(--faint); }
+    .follow-up-input:focus { border-color: var(--signal); outline: none; }
     .send-btn {
-      align-self: flex-end;
-      background: #2563eb;
-      color: #ffffff;
-      border: none;
-      border-radius: 10px;
-      padding: 12px 18px;
+      align-self: stretch;
+      min-width: 88px;
+      background: var(--signal);
+      color: #10130c;
+      border: 1px solid var(--signal);
+      border-radius: 0;
+      padding: 12px 16px;
       font: inherit;
-      font-weight: 600;
+      font-weight: 700;
       cursor: pointer;
       white-space: nowrap;
     }
-    .send-btn:hover:not(:disabled) {
-      background: #3b82f6;
-    }
-    .send-btn:disabled {
-      background: rgba(100, 116, 139, 0.3);
-      color: rgba(148, 163, 184, 0.7);
-      cursor: default;
-    }
+    .send-btn:hover:not(:disabled) { background: #e0ff9d; }
+    .send-btn:disabled { border-color: var(--line); background: var(--line); color: var(--faint); cursor: default; }
     .copy-btn {
-      background: none;
-      border: 1px solid rgba(148, 163, 184, 0.3);
-      color: #94a3b8;
-      border-radius: 8px;
-      padding: 3px 10px;
+      background: transparent;
+      border: 1px solid var(--line-strong);
+      color: var(--muted);
+      border-radius: 0;
+      padding: 4px 9px;
       font: inherit;
-      font-size: 12px;
+      font-size: 10px;
+      text-transform: uppercase;
       cursor: pointer;
       white-space: nowrap;
     }
-    .copy-btn:hover {
-      color: #e2e8f0;
-      border-color: rgba(148, 163, 184, 0.5);
-    }
-    .copy-btn.copied {
-      color: #6ee7b7;
-      border-color: rgba(52, 211, 153, 0.5);
-    }
-    .copy-btn:disabled {
-      opacity: 0.5;
-      cursor: default;
-    }
-    .review-output.error,
-    .follow-up-output.error {
-      color: #fda4af;
-      border: 1px solid rgba(244, 63, 94, 0.35);
-    }
-    .live {
-      min-height: 80px;
+    .copy-btn:hover:not(:disabled) { color: var(--signal); border-color: var(--signal); }
+    .copy-btn.copied { color: var(--signal); border-color: var(--signal); }
+    .copy-btn:disabled { color: var(--faint); border-color: var(--line); cursor: default; }
+    .review-output.error, .follow-up-output.error { color: var(--danger); border-color: rgba(255, 107, 107, .45); }
+    @media (max-width: 560px) {
+      #entries { padding: 12px; }
+      .shell-header { padding: 14px 12px; }
+      .card-top, .source-strip, .answer-block, .follow-up-section { padding-left: 12px; padding-right: 12px; }
+      .source-strip, .follow-up-composer { grid-template-columns: 1fr; }
+      .send-btn { min-height: 44px; }
     }
   </style>
 </head>
 <body>
+  <header class="shell-header">
+    <div><p class="eyebrow">PReview / local inference</p><h1 class="shell-title">Review results</h1></div>
+    <span class="shell-count">${previewEntries.length} submission${previewEntries.length === 1 ? '' : 's'}</span>
+  </header>
   <div id="entries">
-    ${entriesHtml || '<div id="empty-state" class="section"><h1>Ollama Response</h1><p>No submissions yet.</p></div>'}
+    ${entriesHtml || '<div id="empty-state" class="empty-state"><h1>No submissions yet</h1><p>Send a comment from the editor to start a review.</p></div>'}
   </div>
   <script>
     const vscode = acquireVsCodeApi();
@@ -459,7 +463,8 @@ function renderPreviewPanel() {
     });
 
     function getOutputElement(id) {
-      if (!outputById.has(id)) {
+      const cached = outputById.get(id);
+      if (!cached || !cached.isConnected) {
         outputById.set(id, document.getElementById('review-output-' + id));
       }
 
@@ -468,8 +473,9 @@ function renderPreviewPanel() {
 
     function getFollowUpOutputElement(entryId, followUpId) {
       const key = entryId + ':' + followUpId;
+      const cached = followUpOutputById.get(key);
 
-      if (!followUpOutputById.has(key)) {
+      if (!cached || !cached.isConnected) {
         followUpOutputById.set(key, document.getElementById('follow-up-output-' + entryId + '-' + followUpId));
       }
 
@@ -478,15 +484,15 @@ function renderPreviewPanel() {
 
     function statusLabel(status) {
       if (status === 'pending') {
-        return 'Waiting for Ollama';
+        return 'Queued';
       }
 
       if (status === 'streaming') {
-        return 'Streaming';
+        return 'Generating';
       }
 
       if (status === 'error') {
-        return 'Error';
+        return 'Failed';
       }
 
       return 'Done';
@@ -550,7 +556,7 @@ function renderPreviewPanel() {
       const statusNode = document.createElement('span');
       statusNode.className = 'status status-pending';
       statusNode.id = 'fu-status-' + entryId + '-' + followUpId;
-      statusNode.textContent = 'Waiting for Ollama';
+      statusNode.textContent = statusLabel('pending');
 
       const copyNode = document.createElement('button');
       copyNode.className = 'copy-btn';
@@ -563,6 +569,7 @@ function renderPreviewPanel() {
       header.appendChild(copyNode);
 
       const promptNode = document.createElement('p');
+      promptNode.className = 'follow-up-prompt';
       promptNode.textContent = 'Follow-up: ' + prompt;
 
       const outputNode = document.createElement('pre');
@@ -770,15 +777,15 @@ function renderPreviewPanel() {
 
 function statusLabel(status) {
   if (status === 'pending') {
-    return 'Waiting for Ollama';
+    return 'Queued';
   }
 
   if (status === 'streaming') {
-    return 'Streaming';
+    return 'Generating';
   }
 
   if (status === 'error') {
-    return 'Error';
+    return 'Failed';
   }
 
   return 'Done';
@@ -791,23 +798,37 @@ function renderEntryHtml(entry) {
   const sendDisabled = !(entry.composerText || '').trim() ? ' disabled' : '';
 
   return `
-    <div class="section card">
-      <div class="card-header">
-        <span class="status status-${escapeHtml(status)}" id="status-${escapeHtml(entry.id)}">${escapeHtml(statusLabel(status))}</span>
-        <button class="copy-btn" data-copy-entry="${escapeHtml(entry.id)}" ${inFlight ? 'disabled' : ''}>Copy</button>
+    <article class="section card" data-entry-id="${escapeHtml(entry.id)}">
+      <div class="card-top">
+        <div>
+          <div class="entry-index">LINE ${escapeHtml(entry.lineNumber)}</div>
+          <h2 class="entry-title">${escapeHtml(entry.question)}</h2>
+        </div>
+        <div>
+          <span class="status status-${escapeHtml(status)}" id="status-${escapeHtml(entry.id)}">${escapeHtml(statusLabel(status))}</span>
+          <button class="copy-btn" data-copy-entry="${escapeHtml(entry.id)}" ${inFlight ? 'disabled' : ''}>Copy answer</button>
+        </div>
       </div>
-      <p>Model: ${escapeHtml(entry.model)}</p>
-      <p>Question: ${escapeHtml(entry.question)}</p>
-      <p>Line ${entry.lineNumber}: ${escapeHtml(entry.lineText)}</p>
-      <pre class="live review-output${status === 'error' ? ' error' : ''}" id="review-output-${escapeHtml(entry.id)}">${escapeHtml(entry.review)}</pre>
-      <div class="follow-up-list" id="follow-up-list-${escapeHtml(entry.id)}">
-        ${followUpHtml}
+      <div class="source-strip">
+        <div><span class="source-label">Selected line</span><span class="source-value"><strong>${escapeHtml(entry.lineNumber)}:</strong> ${escapeHtml(entry.lineText)}</span></div>
+        <div><span class="source-label">Model</span><span class="source-value">${escapeHtml(entry.model)}</span></div>
       </div>
-      <div class="follow-up-composer">
-        <textarea class="follow-up-input" id="follow-up-input-${escapeHtml(entry.id)}" data-entry-id="${escapeHtml(entry.id)}" placeholder="Ask a follow-up. Enter to send, Shift+Enter for a new line.">${escapeHtml(entry.composerText || '')}</textarea>
-        <button class="send-btn" id="send-btn-${escapeHtml(entry.id)}" data-entry-id="${escapeHtml(entry.id)}"${sendDisabled}>Send</button>
-      </div>
-    </div>
+      <section class="answer-block" aria-label="Review answer">
+        <div class="block-label"><span>Assistant answer</span><span>${escapeHtml(statusLabel(status))}</span></div>
+        <pre class="review-output${status === 'error' ? ' error' : ''}" id="review-output-${escapeHtml(entry.id)}">${escapeHtml(entry.review)}</pre>
+      </section>
+      <section class="follow-up-section" aria-label="Follow-up questions">
+        <div class="follow-up-list" id="follow-up-list-${escapeHtml(entry.id)}">
+          ${followUpHtml}
+        </div>
+        <p class="composer-label">Continue this review</p>
+        <div class="follow-up-composer">
+          <textarea class="follow-up-input" id="follow-up-input-${escapeHtml(entry.id)}" data-entry-id="${escapeHtml(entry.id)}" rows="3" aria-label="Follow-up question" placeholder="Ask about the finding, request a fix, or ask for an explanation.">${escapeHtml(entry.composerText || '')}</textarea>
+          <button class="send-btn" id="send-btn-${escapeHtml(entry.id)}" data-entry-id="${escapeHtml(entry.id)}"${sendDisabled}>Send</button>
+        </div>
+        <p class="composer-label">Enter to send · Shift+Enter for a new line</p>
+      </section>
+    </article>
   `;
 }
 
@@ -819,9 +840,9 @@ function renderFollowUpHtml(entryId, followUp) {
     <div class="follow-up-item" id="follow-up-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">
       <div class="follow-up-item-header">
         <span class="status status-${escapeHtml(status)}" id="fu-status-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">${escapeHtml(statusLabel(status))}</span>
-        <button class="copy-btn" data-copy-entry="${escapeHtml(entryId)}" data-copy-follow-up="${escapeHtml(followUp.id)}" ${inFlight ? 'disabled' : ''}>Copy</button>
+        <button class="copy-btn" data-copy-entry="${escapeHtml(entryId)}" data-copy-follow-up="${escapeHtml(followUp.id)}" ${inFlight ? 'disabled' : ''}>Copy answer</button>
       </div>
-      <p>Follow-up: ${escapeHtml(followUp.prompt)}</p>
+      <p class="follow-up-prompt"><strong>Follow-up:</strong> ${escapeHtml(followUp.prompt)}</p>
       <pre class="follow-up-output${status === 'error' ? ' error' : ''}" id="follow-up-output-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">${escapeHtml(followUp.review)}</pre>
     </div>
   `;
@@ -903,7 +924,7 @@ async function handleFollowUp(entryId, prompt, outputChannel) {
       status: followUp.status
     });
   } catch (error) {
-    const message = `[review-comments] follow-up failed: ${error.message}`;
+    const message = `[review-comments] follow-up failed: ${formatOllamaError(error, getOllamaSettings().url)}`;
     console.error(message);
     outputChannel.appendLine(message);
     const latestFollowUp = previewEntries.find(item => item.id === entryId)?.followUps.slice(-1)[0];
@@ -955,7 +976,7 @@ async function getOllamaReview(payload, outputChannel, ollamaSettings, panel, en
           : 'Ollama request cancelled'
       );
     }
-    throw error;
+    throw new Error(formatOllamaError(error, ollamaSettings.url));
   } finally {
     request.cleanup();
   }
@@ -996,10 +1017,20 @@ async function getOllamaFollowUpReview(entry, prompt, outputChannel, followUpId)
           : 'Ollama request cancelled'
       );
     }
-    throw error;
+    throw new Error(formatOllamaError(error, ollamaSettings.url));
   } finally {
     request.cleanup();
   }
+}
+
+function formatOllamaError(error, url) {
+  const message = error?.message || String(error);
+
+  if (/fetch failed|failed to fetch|networkerror|connection refused/i.test(message)) {
+    return `Could not connect to Ollama at ${url}. Start Ollama with \`ollama serve\`, then confirm the reviewComments.ollamaUrl setting. (${message})`;
+  }
+
+  return message;
 }
 
 function buildOllamaRequestBody(payload, model) {
@@ -1256,7 +1287,7 @@ function normalizeText(value) {
 }
 
 function escapeHtml(value) {
-  return value
+  return String(value ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -1275,5 +1306,6 @@ module.exports = {
   collectContext,
   normalizeText,
   escapeHtml,
-  truncateForModel
+  truncateForModel,
+  formatOllamaError
 };
