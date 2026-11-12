@@ -1,0 +1,6 @@
+.vscode/**
+.omc/**
+test/**
+.gitignore
+AGENTS.md
+**/*.map

@@ -1,81 +1,63 @@
 # PReview AI Comments
 
-PReview AI Comments is a VS Code extension that sends a comment-thread selection to a local Ollama model and shows the result in a preview panel. It is designed for quick code explanations and review-style feedback directly from the Comments UI.
+Line-level AI code review inside VS Code comment threads. Ask about any line, get an answer in the editor thread and in the PReview panel, then keep the conversation going with follow-ups. It runs on a local Ollama model by default, and you can send any single question to Claude when you want a stronger answer.
 
 ## Features
 
-- Adds a `Review Comments: Send to AI` action to comment threads.
-- Sends the selected code, surrounding context, and your comment text to Ollama.
-- Streams the model response into a preview panel.
-- Supports both review prompts and explanation prompts.
-- Hides the serialized payload from the UI and output channel.
+- **Ask from the gutter.** Click **+** next to a line, type a question (or leave it blank for a review), then press **Send comment**. The answer is posted back into that thread.
+- **Ask from a selection.** Select code, right-click, then **PReview: Review Selection** or **Explain Selection** (`Cmd+Alt+R` / `Ctrl+Alt+R` reviews the selection).
+- **Real conversations.** Reply in the editor thread or in the panel. Every follow-up sends the whole conversation and the code context.
+- **Severity-tagged reviews.** Findings are tagged high, medium or low and come with concrete fixes. Each code block has a Copy button.
+- **Claude on demand.** Every Ollama answer has an **Ask Claude** button that re-runs just that question with Claude. Or switch the default provider from the status bar.
+- **Panel that matches your theme.** It uses VS Code theme colours (light, dark, high contrast). It shows streaming output, Stop and Retry, time taken, token usage for Claude, and a jump-to-code link on every review.
 
 ## Requirements
 
-- VS Code 1.90.0 or newer.
-- Ollama installed and running locally.
-- A downloaded model. The default is `qwen2.5-coder:7b`.
+- VS Code 1.90 or newer.
+- For the default provider: [Ollama](https://ollama.com) running locally with a model pulled (default `qwen2.5-coder:7b`).
+- For Claude (optional): an Anthropic API key.
 
 ## Setup
 
-1. Start Ollama.
-   ```bash
-   ollama serve
-   ```
-2. Make sure the model is available.
-   ```bash
-   ollama list
-   ```
-3. Open the extension in VS Code.
-4. Launch the Extension Development Host from the Run and Debug view.
-
-## Usage
-
-1. Open a file in VS Code.
-2. Create or open a comment thread on a line of code.
-3. Add a comment such as `explain this function` or a review request.
-4. Click `Send comment` from the thread actions.
-5. Wait for the `AI Review Result` panel to appear.
-
-If your comment text includes `explain`, the extension asks Ollama to explain the selected code in plain language. Otherwise, it asks for concise review feedback.
-
-## Configuration
-
-The extension exposes two settings:
-
-- `reviewComments.ollamaUrl`
-- `reviewComments.ollamaModel`
-
-Defaults:
-
-```json
-{
-  "reviewComments.ollamaUrl": "http://127.0.0.1:11434/api/chat",
-  "reviewComments.ollamaModel": "qwen2.5-coder:7b"
-}
+```bash
+npm install
+ollama serve
+ollama pull qwen2.5-coder:7b
 ```
 
-Set these in VS Code settings if you want to use a different local Ollama endpoint or model.
+Open the folder in VS Code and press F5 (**Run Extension**) to start an Extension Development Host.
+
+### Using Claude
+
+1. Run **PReview: Set Claude API Key** from the Command Palette. The key goes into VS Code Secret Storage, never into settings. `ANTHROPIC_API_KEY` in the environment also works.
+2. Click **Ask Claude** on any answer, or click the **PReview** status bar item to make Claude the default.
+
+Nothing is sent to Claude unless you pick it. Ollama stays the default.
+
+## Settings
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `reviewComments.provider` | `ollama` | Default provider: `ollama` or `anthropic` |
+| `reviewComments.ollamaUrl` | `http://127.0.0.1:11434/api/chat` | Ollama chat endpoint |
+| `reviewComments.ollamaModel` | `qwen2.5-coder:7b` | Ollama model |
+| `reviewComments.anthropicModel` | `claude-opus-5-5` | Claude model ID |
+| `reviewComments.anthropicEffort` | `medium` | Claude effort: `low` … `max` (higher is more thorough and costs more) |
+| `reviewComments.contextLines` | `15` | Lines of surrounding code sent above and below the selection |
+| `reviewComments.replyInThread` | `true` | Also post answers into the editor comment thread |
 
 ## Troubleshooting
 
-- If the action is not visible, reload the Extension Development Host after changing the extension.
-- If the response does not appear, confirm that Ollama is running and the model name matches your local install.
-- If the model fails to respond, check the Output panel for `AI Review Comments`.
-- If you changed the model or endpoint, make sure the extension settings still point to a reachable local Ollama server.
+- **"Could not reach Ollama"**: run `ollama serve`, or fix `reviewComments.ollamaUrl`.
+- **"Model … is not installed"**: run the `ollama pull …` command shown, or change `reviewComments.ollamaModel`.
+- **"Claude rejected the API key"**: run **PReview: Set Claude API Key** again.
+- Logs are in the **Output** panel under **PReview**.
 
 ## Development
 
-Lint the main file with:
-
 ```bash
-npm run lint
+npm run lint   # syntax check of every source file
+npm test       # unit tests (Node 18+). No network: the Claude client is faked.
 ```
 
-Run the unit tests (Node 18+, no dependencies):
-
-```bash
-npm test
-```
-
-The extension entrypoint is [extension.js](extension.js), and the manifest is [package.json](package.json).
+Layout: `extension.js` (VS Code host), `lib/providers.js` (prompts, Ollama and Claude streaming), `media/` (webview UI).

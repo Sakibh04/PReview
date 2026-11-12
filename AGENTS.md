@@ -1,30 +1,25 @@
 # AGENTS.md
 
-Single-file VS Code extension. All extension logic lives in `extension.js` (entrypoint `activate`), with the full webview UI (HTML/CSS/JS) embedded as inline template literals in `renderPreviewPanel()`.
+VS Code extension, plain CommonJS, no build step.
+
+- `extension.js`: host. Activation, commands, comment-thread sync, webview panel, request lifecycle.
+- `lib/providers.js`: pure Node (no `vscode` import). Prompt building (`buildMessages`), Ollama NDJSON streaming, and Claude streaming via `@anthropic-ai/sdk`.
+- `media/preview.js` + `media/preview.css`: webview UI, loaded as real files via `asWebviewUri` with a nonce CSP. `preview.js` also exports `renderMarkdown` under Node for tests.
 
 ## Dev commands
 
-- `npm run lint` is only a syntax check (`node --check extension.js`). It catches parse errors, not runtime/API errors.
-- `npm test` runs `node --test` (Node 18+). Tests live in `test/extension.test.js`; they stub `vscode` via `Module._load` before requiring `extension.js`, so keep requiring `vscode` at the top of the file.
-- Pure helpers (`buildOllamaRequestBody`, `buildFollowUpRequestBody`, `parseOllamaLine`, `collectContext`, `normalizeText`, `escapeHtml`, `truncateForModel`) are exported from `extension.js` solely so the tests can reach them.
-- No build step, no formatter config.
+- `npm run lint`: `node --check` on each source file (syntax only).
+- `npm test`: `node --test`. `test/extension.test.js` stubs `vscode` via `Module._load` before requiring `extension.js`. The Claude tests inject `createClient`, so they make no network calls and spend no credits.
+- Debug with the `.vscode/launch.json` "Run Extension" config (F5).
 
-## Running the extension
+## Architecture notes
 
-- Debug via the `.vscode/launch.json` "Run Extension" config (F5 from Run and Debug view) → Extension Development Host.
-- Runtime requires Ollama running locally: `ollama serve`, with model `qwen2.5-coder:7b` pulled. Defaults live in `extension.js` (`OLLAMA_URL`, `OLLAMA_MODEL`) and mirror the `reviewComments.ollamaUrl` / `reviewComments.ollamaModel` settings.
-- `getOllamaSettings()` reads settings first, falling back to the constants. Keep the two in sync if you change a default.
-
-## Gotchas
-
-- Uses global `fetch` (modern VS Code runtime) — `getOllamaReview` throws if `fetch` is missing.
-- The webview is rendered once when the panel is created; it is NOT re-rendered on updates. New submission cards are appended via an `entry-added` postMessage, and all other updates (chunks, finals, statuses) go through postMessage only. State lives in module-level `previewEntries` and the webview DOM survives via `retainContextWhenHidden`; both reset when the panel is disposed (`onDidDispose`). Do not call `renderPreviewPanel()` to push updates — it reloads the whole webview and wipes the follow-up textareas.
-- The webview announces `{ type: 'webview-ready' }` at the end of its script; `handleSubmit` awaits `waitForWebviewReady()` (5s fallback) before streaming so messages posted to a freshly-created webview are never lost.
-- `renderPreviewPanel()` is called as a deterministic safety net after every `review-final`/`follow-up-final` (in addition to the postMessage) so results display even if a postMessage is lost. Because this reloads the webview, the follow-up composer survives via TWO mechanisms: the webview posts `composer-change` on every input (stored as `entry.composerText` and re-rendered into the textarea), and `vscode.setState` (`textareas` key) restores values on script load. The Send button's initial disabled state is derived from `entry.composerText`. Do not remove the re-render or the composer persistence independently — they exist to fix "stuck at Waiting for Ollama" without regressing the greyed-out Send button.
-- Webview HTML uses `script-src 'unsafe-inline'` (CSP) to guarantee the inline script runs in all environments. The `<script>` tag must NOT carry a `nonce` attribute — per CSP3 a nonce on the element disables `'unsafe-inline'` for it, and with no matching `nonce-...` source in the CSP the script is silently blocked. All user/model text is inserted via `escapeHtml()`. The webview reports runtime errors back via a `webview-error` postMessage, logged to the output channel.
-- **Template-literal escape trap:** the whole webview HTML/JS is one JS template literal, so any backslash in the webview JS is resolved by Node at render time. A `'\n'` in the webview code becomes a literal newline in the output and is a `SyntaxError` in the browser, which silently prevents the ENTIRE main script from running (reviews still render via the deterministic `renderPreviewPanel()` re-render, but no listeners/composer work). Write `'\\n'` so the rendered HTML contains `'\n'`. When checking the webview script, syntax-check the RENDERED HTML (escape-resolved), not the raw template source — `node --check` on the raw literal passes while the browser sees invalid JS.
-- The "Send comment" command receives a comment reply object; `handleSubmit` resolves the thread via `reply?.thread ?? reply` and requires `thread.uri` + `thread.range`.
-- Ollama streaming: the NDJSON response is parsed line-by-line in `readOllamaStream`/`parseOllamaLine`; chunk messages are posted to the webview. `markStreaming` fires on the first chunk to flip an entry/follow-up to `streaming`.
-- Entries and follow-ups carry a `status` (`pending`/`streaming`/`done`/`error`) mirrored into the webview via `review-final`/`follow-up-final` messages; error text renders in red. The webview posts `send-follow-up` (composer Enter or the Send button) and `copy-review`/`copy-done` (Copy buttons) messages back.
-- Requests use an `AbortController` (`createRequestSignal`) with a 120s timeout; `abortActiveRequests()` fires on panel dispose. All webview posts go through `postToPanel`, which no-ops after the panel is disposed. Follow-up context is bounded via `truncateForModel`.
-- Debug logging goes to the "AI Review Comments" output channel and the same string is prefixed `[review-comments]`.
+- **State lives in the host.** `entries[]` holds each review: `payload` (file, range, numbered context lines) and `turns[]` (`prompt`, `answer`, `status` of `pending|streaming|done|error|cancelled`, `provider`, `model`, timings, `usage`). Turn 0 is the original question, and later turns are follow-ups.
+- **The webview renders from data only.** Host → webview messages: `init` (full state, sent in reply to `ready`), `entry` (upsert one entry), `chunk` (streamed text for one turn), `removed`, `provider`. Webview → host: `ready`, `follow-up`, `retry`, `ask-claude`, `cancel`, `copy`, `reveal`, `remove`, `clear`, `select-provider`, `webview-error`. Because the webview always gets a full `init` on load, messages lost before `ready` don't matter. Never rebuild `webview.html` to push updates.
+- **Entries outlive the panel.** Closing the panel does not abort requests. `showPanel` recreates it and the `ready`/`init` handshake restores everything.
+- **Comment threads.** `threadToEntry` maps a thread to its entry, so a reply typed in a thread that already has an entry becomes a follow-up. `syncThread` rewrites `thread.comments` at each turn's start and end, not per chunk.
+- **Conversation replay.** `buildMessages(entry, i)` replays only `done` turns before `i`, so user and assistant roles always alternate. The code context rides on the first user message.
+- **Claude.** The default model is `claude-opus-5-5` with `output_config.effort` (default `medium`). Don't send `thinking: {type: "disabled"}` or `budget_tokens`, which return 400 on that model. Supported models also get server-side refusal fallbacks (`betas: ['server-side-fallback-2026-07-01']`, `fallbacks: 'default'`). The API key is stored in `context.secrets` (`reviewComments.anthropicApiKey`), with `ANTHROPIC_API_KEY` as a fallback. Claude is only called when the provider setting is `anthropic` or the user clicks **Ask Claude**.
+- Requests time out after 180s (`REQUEST_TIMEOUT_MS`). Every request has its own `AbortController` in `activeRequests` (key `entryId:turnId`).
+- Defaults in `lib/providers.js` (`OLLAMA_URL`, `OLLAMA_MODEL`, `ANTHROPIC_MODEL`, `ANTHROPIC_EFFORT`) must match the `contributes.configuration` defaults in `package.json`.
+- Model text is always escaped (`escapeHtml` in `preview.js`) before markdown formatting is applied.
