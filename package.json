@@ -1,8 +1,8 @@
 {
   "name": "preview-ai-comments",
   "displayName": "PReview AI Comments",
-  "description": "Line-level review comments in VS Code, routed to an AI responder.",
-  "version": "0.0.1",
+  "description": "Line-level AI code review in VS Code comment threads. Runs on local Ollama, with Claude on demand.",
+  "version": "0.2.0",
   "publisher": "sakibhossain",
   "engines": {
     "vscode": "^1.90.0"
@@ -14,48 +14,168 @@
     "onStartupFinished"
   ],
   "main": "./extension.js",
-  "configuration": {
-    "title": "PReview AI Comments",
-    "properties": {
-      "reviewComments.ollamaUrl": {
-        "type": "string",
-        "default": "http://127.0.0.1:11434/api/chat",
-        "description": "Ollama chat endpoint used to review submitted comments."
-      },
-      "reviewComments.ollamaModel": {
-        "type": "string",
-        "default": "qwen2.5-coder:7b",
-        "description": "Ollama model used to review submitted comments."
-      }
-    }
-  },
   "contributes": {
+    "configuration": {
+      "title": "PReview AI Comments",
+      "properties": {
+        "reviewComments.provider": {
+          "type": "string",
+          "enum": [
+            "ollama",
+            "anthropic"
+          ],
+          "enumDescriptions": [
+            "Local Ollama model. Free and private.",
+            "Claude via the Anthropic API. Uses your API credits."
+          ],
+          "default": "ollama",
+          "description": "Default AI provider. You can always re-run a single answer with Claude from the panel."
+        },
+        "reviewComments.ollamaUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434/api/chat",
+          "description": "Ollama chat endpoint."
+        },
+        "reviewComments.ollamaModel": {
+          "type": "string",
+          "default": "qwen2.5-coder:7b",
+          "description": "Ollama model name (must be pulled locally)."
+        },
+        "reviewComments.anthropicModel": {
+          "type": "string",
+          "default": "claude-opus-5-5",
+          "description": "Claude model ID used when the provider is Claude or when you click Ask Claude."
+        },
+        "reviewComments.anthropicEffort": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium",
+          "description": "How much Claude thinks before answering. Higher is more thorough and uses more tokens."
+        },
+        "reviewComments.contextLines": {
+          "type": "number",
+          "default": 15,
+          "minimum": 0,
+          "maximum": 200,
+          "description": "Lines of surrounding code sent with the selection, above and below."
+        },
+        "reviewComments.replyInThread": {
+          "type": "boolean",
+          "default": true,
+          "description": "Post AI answers back into the editor comment thread, not only the PReview panel."
+        }
+      }
+    },
     "commands": [
       {
         "command": "reviewComments.submitComment",
-        "title": "Send comment"
+        "title": "Send comment",
+        "category": "PReview",
+        "icon": "$(send)"
+      },
+      {
+        "command": "reviewComments.reviewSelection",
+        "title": "Review Selection",
+        "category": "PReview"
+      },
+      {
+        "command": "reviewComments.explainSelection",
+        "title": "Explain Selection",
+        "category": "PReview"
+      },
+      {
+        "command": "reviewComments.showPanel",
+        "title": "Show Panel",
+        "category": "PReview"
+      },
+      {
+        "command": "reviewComments.selectProvider",
+        "title": "Switch AI Provider",
+        "category": "PReview"
+      },
+      {
+        "command": "reviewComments.setAnthropicKey",
+        "title": "Set Claude API Key",
+        "category": "PReview"
+      },
+      {
+        "command": "reviewComments.clearAnthropicKey",
+        "title": "Remove Claude API Key",
+        "category": "PReview"
+      },
+      {
+        "command": "reviewComments.deleteThread",
+        "title": "Dismiss",
+        "category": "PReview",
+        "icon": "$(close)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "reviewComments.reviewSelection",
+        "key": "ctrl+alt+r",
+        "mac": "cmd+alt+r",
+        "when": "editorTextFocus && editorHasSelection"
       }
     ],
     "menus": {
-      "comments/commentThread/title": [
-        {
-          "command": "reviewComments.submitComment",
-          "group": "inline"
-        }
-      ],
       "comments/commentThread/context": [
         {
           "command": "reviewComments.submitComment",
-          "group": "inline"
+          "group": "inline",
+          "when": "commentController == reviewComments"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "reviewComments.deleteThread",
+          "group": "navigation",
+          "when": "commentController == reviewComments && commentThread == preview-thread"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "reviewComments.reviewSelection",
+          "group": "9_preview@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "reviewComments.explainSelection",
+          "group": "9_preview@2",
+          "when": "editorHasSelection"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "reviewComments.submitComment",
+          "when": "false"
+        },
+        {
+          "command": "reviewComments.deleteThread",
+          "when": "false"
+        },
+        {
+          "command": "reviewComments.reviewSelection",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "reviewComments.explainSelection",
+          "when": "editorHasSelection"
         }
       ]
     }
   },
   "scripts": {
-    "lint": "node --check extension.js",
+    "lint": "node --check extension.js && node --check lib/providers.js && node --check media/preview.js",
     "test": "node --test"
   },
-  "devDependencies": {
-    "vscode": "^1.1.37"
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0"
   }
 }

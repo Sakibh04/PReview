@@ -2,1511 +2,494 @@
 
 const crypto = require('node:crypto');
 const vscode = require('vscode');
+const providers = require('./lib/providers');
 
 const CONTROLLER_ID = 'reviewComments';
-const CONTROLLER_LABEL = 'AI Review Comments';
-const OLLAMA_URL = 'http://127.0.0.1:11434/api/chat';
-const OLLAMA_MODEL = 'qwen2.5-coder:7b';
-const REQUEST_TIMEOUT_MS = 120000;
-const HEALTH_CHECK_TIMEOUT_MS = 5000;
-const MAX_REVIEW_CONTEXT = 6000;
-const MAX_PAYLOAD_CONTEXT = 12000;
+const CONTROLLER_LABEL = 'PReview';
+const SECRET_ANTHROPIC_KEY = 'reviewComments.anthropicApiKey';
+const REQUEST_TIMEOUT_MS = 180000;
+const AI_AUTHOR = 'PReview';
 
-let previewPanel;
-let previewEntries = [];
-let webviewReady = false;
-let resolveWebviewReady = null;
-const activeRequests = new Set();
-const activeRequestsByKey = new Map();
+/** @type {{ context: vscode.ExtensionContext, output: vscode.OutputChannel, controller: vscode.CommentController, statusBar: vscode.StatusBarItem } | undefined} */
+let host;
+let panel;
+let entries = [];
+const threadToEntry = new WeakMap();
+const activeRequests = new Map();
+
+function log(message) {
+  host?.output.appendLine(`[review-comments] ${message}`);
+}
+
+// ------------------------------------------------------------------ activate
 
 function activate(context) {
-  const outputChannel = vscode.window.createOutputChannel('AI Review Comments');
+  const output = vscode.window.createOutputChannel('PReview');
   const controller = vscode.comments.createCommentController(CONTROLLER_ID, CONTROLLER_LABEL);
+  const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  host = { context, output, controller, statusBar };
 
   controller.options = {
-    prompt: 'Send this comment to the AI reviewer',
-    placeHolder: 'Write feedback, then submit it from the thread actions.'
+    prompt: 'Ask PReview about this code…',
+    placeHolder: 'e.g. "any bugs here?", "explain this", "make this async". Leave empty for a general review.'
   };
-
   controller.commentingRangeProvider = {
     provideCommentingRanges(document) {
-      if (document.lineCount === 0) {
+      if (document.lineCount === 0 || document.uri.scheme === 'comment') {
         return [];
       }
-
-      const endLine = document.lineCount - 1;
-      const endCharacter = document.lineAt(endLine).range.end.character;
-      return [new vscode.Range(0, 0, endLine, endCharacter)];
+      const end = document.lineCount - 1;
+      return [new vscode.Range(0, 0, end, document.lineAt(end).range.end.character)];
     }
   };
 
+  statusBar.command = 'reviewComments.selectProvider';
+  updateStatusBar();
+  statusBar.show();
+
   context.subscriptions.push(
-    outputChannel,
+    output,
     controller,
-    vscode.commands.registerCommand('reviewComments.submitComment', async reply => {
-      outputChannel.show(true);
-      outputChannel.appendLine('[review-comments] submit command invoked');
-      await handleSubmit(reply, outputChannel);
+    statusBar,
+    vscode.commands.registerCommand('reviewComments.submitComment', reply => submitFromThread(reply)),
+    vscode.commands.registerCommand('reviewComments.reviewSelection', () => submitFromSelection('review')),
+    vscode.commands.registerCommand('reviewComments.explainSelection', () => submitFromSelection('explain')),
+    vscode.commands.registerCommand('reviewComments.showPanel', () => showPanel(true)),
+    vscode.commands.registerCommand('reviewComments.selectProvider', selectProvider),
+    vscode.commands.registerCommand('reviewComments.setAnthropicKey', () => promptForAnthropicKey()),
+    vscode.commands.registerCommand('reviewComments.clearAnthropicKey', async () => {
+      await context.secrets.delete(SECRET_ANTHROPIC_KEY);
+      vscode.window.showInformationMessage('PReview: Claude API key removed.');
+    }),
+    vscode.commands.registerCommand('reviewComments.deleteThread', thread => removeThread(thread)),
+    vscode.workspace.onDidChangeConfiguration(event => {
+      if (event.affectsConfiguration('reviewComments')) {
+        updateStatusBar();
+        postProviderInfo();
+      }
     })
   );
 
+  return { controller };
+}
+
+function deactivate() {
+  for (const controller of activeRequests.values()) {
+    controller.abort();
+  }
+  activeRequests.clear();
+}
+
+// ------------------------------------------------------------------ settings
+
+function getSettings() {
+  const config = vscode.workspace.getConfiguration('reviewComments');
   return {
-    controller
+    provider: config.get('provider', 'ollama') === 'anthropic' ? 'anthropic' : 'ollama',
+    ollamaUrl: config.get('ollamaUrl', providers.OLLAMA_URL),
+    ollamaModel: config.get('ollamaModel', providers.OLLAMA_MODEL),
+    anthropicModel: config.get('anthropicModel', providers.ANTHROPIC_MODEL),
+    anthropicEffort: config.get('anthropicEffort', providers.ANTHROPIC_EFFORT),
+    contextLines: Math.max(0, Math.min(200, Number(config.get('contextLines', 15)) || 0)),
+    replyInThread: config.get('replyInThread', true)
   };
 }
 
-async function handleSubmit(reply, outputChannel) {
+function providerInfo(settings = getSettings()) {
+  return settings.provider === 'anthropic'
+    ? { id: 'anthropic', label: 'Claude', model: settings.anthropicModel }
+    : { id: 'ollama', label: 'Ollama', model: settings.ollamaModel };
+}
+
+function updateStatusBar() {
+  if (!host) {
+    return;
+  }
+  const running = activeRequests.size;
+  const info = providerInfo();
+  host.statusBar.text = running
+    ? `$(sync~spin) PReview: ${info.label}`
+    : `$(comment-discussion) PReview: ${info.label}`;
+  host.statusBar.tooltip = `PReview is using ${info.label} (${info.model}). Click to switch provider.`;
+}
+
+async function selectProvider() {
+  const settings = getSettings();
+  const picked = await vscode.window.showQuickPick(
+    [
+      {
+        label: '$(server) Ollama',
+        description: settings.ollamaModel,
+        detail: 'Runs locally. Free, private, needs `ollama serve`.',
+        id: 'ollama'
+      },
+      {
+        label: '$(sparkle) Claude',
+        description: settings.anthropicModel,
+        detail: 'Anthropic API. Stronger reviews, uses your API credits.',
+        id: 'anthropic'
+      }
+    ],
+    { title: 'PReview: default AI provider', placeHolder: `Currently: ${providerInfo(settings).label}` }
+  );
+  if (!picked) {
+    return;
+  }
+  if (picked.id === 'anthropic' && !(await getAnthropicKey({ prompt: true }))) {
+    return;
+  }
+  await vscode.workspace.getConfiguration('reviewComments').update('provider', picked.id, vscode.ConfigurationTarget.Global);
+}
+
+async function getAnthropicKey({ prompt }) {
+  const stored = await host.context.secrets.get(SECRET_ANTHROPIC_KEY);
+  if (stored) {
+    return stored;
+  }
+  if (process.env.ANTHROPIC_API_KEY) {
+    return process.env.ANTHROPIC_API_KEY;
+  }
+  return prompt ? promptForAnthropicKey() : undefined;
+}
+
+async function promptForAnthropicKey() {
+  const key = await vscode.window.showInputBox({
+    title: 'PReview: Claude API key',
+    prompt: 'Stored in VS Code Secret Storage, never in settings. Create one at console.anthropic.com.',
+    placeHolder: 'sk-ant-…',
+    password: true,
+    ignoreFocusOut: true,
+    validateInput: value => (value.trim().startsWith('sk-ant-') ? undefined : 'Claude API keys start with "sk-ant-"')
+  });
+  if (!key) {
+    return undefined;
+  }
+  await host.context.secrets.store(SECRET_ANTHROPIC_KEY, key.trim());
+  vscode.window.showInformationMessage('PReview: Claude API key saved.');
+  return key.trim();
+}
+
+// ------------------------------------------------------------------ submit
+
+async function submitFromThread(reply) {
   try {
-    outputChannel.appendLine(`[review-comments] reply type: ${typeof reply}`);
-
     const thread = reply?.thread ?? reply;
-    const commentText = normalizeText(reply?.text);
-    const ollamaSettings = getOllamaSettings();
+    const text = normalizeText(reply?.text).trim();
 
-    if (!thread || !thread.uri || !thread.range) {
-      const message = '[review-comments] submit ignored: missing thread or range';
-      outputChannel.appendLine(message);
-      vscode.window.showWarningMessage('Review Comments: missing thread data');
+    if (!thread?.uri || !thread?.range) {
+      vscode.window.showWarningMessage('PReview: open a comment thread first.');
       return;
     }
 
-    outputChannel.appendLine('[review-comments] opening document');
-    const document = await vscode.workspace.openTextDocument(thread.uri);
-    outputChannel.appendLine('[review-comments] document opened');
-
-    const selectedRange = thread.range;
-    const code = document.getText(selectedRange);
-    const contextLines = collectContext(document, selectedRange, 10);
-    const anchorText = code.trim() || contextLines.selected.join('\n').trim();
-
-    const payload = {
-      filePath: thread.uri.fsPath,
-      relativePath: vscode.workspace.asRelativePath(thread.uri, false),
-      range: {
-        startLine: selectedRange.start.line + 1,
-        startCharacter: selectedRange.start.character + 1,
-        endLine: selectedRange.end.line + 1,
-        endCharacter: selectedRange.end.character + 1
-      },
-      code,
-      surroundingContext: contextLines,
-      commentText,
-      threadHistory: (thread.comments ?? []).map(comment => ({
-        author: comment?.author?.name ?? 'unknown',
-        body: normalizeText(comment?.body),
-        timestamp: comment?.timestamp ? new Date(comment.timestamp).toISOString() : undefined
-      })),
-      anchorHash: crypto.createHash('sha1').update(anchorText).digest('hex')
-    };
-
-    const entry = createPreviewEntry(payload, ollamaSettings);
-    const isNewPanel = !previewPanel;
-    const panel = showSubmissionPreview(outputChannel);
-
-    if (!isNewPanel) {
-      postToPanel(panel, {
-        type: 'entry-added',
-        id: entry.id,
-        html: renderEntryHtml(entry)
-      });
-    } else {
-      await waitForWebviewReady();
-      outputChannel.appendLine(`[review-comments] webview ready (fallback=${!webviewReady}), starting request`);
+    const existing = entries.find(entry => entry.id === threadToEntry.get(thread));
+    if (existing) {
+      if (!text) {
+        vscode.window.showInformationMessage('PReview: type a follow-up in the reply box first.');
+        return;
+      }
+      await askFollowUp(existing, text);
+      return;
     }
 
-    await runReview(entry, outputChannel, panel);
+    await startEntry(thread, text, providers.detectMode(text));
   } catch (error) {
-    const message = `[review-comments] submit failed: ${error.message}`;
-    console.error(message);
-    outputChannel.appendLine(message);
-    vscode.window.showErrorMessage('Review Comments: submission failed');
+    log(`submit failed: ${error.stack || error.message}`);
+    vscode.window.showErrorMessage(`PReview: ${error.message}`);
   }
 }
 
-async function runReview(entry, outputChannel, panel) {
-  entry.status = 'pending';
-  entry.review = '';
-  postToPanel(panel, { type: 'entry-updated', id: entry.id, html: renderEntryHtml(entry) });
-
-  try {
-    await checkOllamaAvailability(entry.settings.url, entry.settings.model, entry.id);
-    entry.review = await getOllamaReview(entry.payload, outputChannel, entry.settings, panel, entry.id);
-    entry.status = 'done';
-  } catch (error) {
-    const message = `[review-comments] Ollama review failed: ${error.message}`;
-    console.error(message);
-    outputChannel.appendLine(message);
-    entry.review = message;
-    entry.status = 'error';
+async function submitFromSelection(mode) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    vscode.window.showWarningMessage('PReview: open a file and select some code first.');
+    return;
   }
-
-  postToPanel(panel, {
-    type: 'entry-updated',
-    id: entry.id,
-    html: renderEntryHtml(entry)
-  });
+  const selection = editor.selection;
+  const range = new vscode.Range(selection.start.line, 0, selection.end.line, editor.document.lineAt(selection.end.line).range.end.character);
+  const thread = host.controller.createCommentThread(editor.document.uri, range, []);
+  thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+  await startEntry(thread, '', mode);
 }
 
-function createPreviewEntry(payload, ollamaSettings) {
-  const selectedLine = payload.surroundingContext?.selected?.[0] ?? '';
-  const selectedLineText = selectedLine.replace(/^\d+:\s*/, '');
+async function startEntry(thread, commentText, mode) {
+  const document = await vscode.workspace.openTextDocument(thread.uri);
+  const settings = getSettings();
+  const payload = buildPayload(document, thread.range, settings.contextLines);
 
   const entry = {
     id: crypto.randomUUID(),
+    mode,
+    createdAt: Date.now(),
     payload,
-    question: payload.commentText || 'Review this code.',
-    lineNumber: payload.range?.startLine ?? 1,
-    lineText: selectedLineText || '(no selected line)',
-    model: ollamaSettings.model,
-    settings: ollamaSettings,
-    review: '',
+    uri: thread.uri.toString(),
+    thread,
+    hasUserComment: Boolean(commentText),
+    turns: []
+  };
+  entry.turns.push(createTurn(commentText || providers.defaultQuestion(mode)));
+
+  entries.push(entry);
+  threadToEntry.set(thread, entry.id);
+  thread.label = 'PReview';
+  thread.canReply = true;
+  thread.contextValue = 'preview-thread';
+
+  showPanel(false);
+  await runTurn(entry, entry.turns[0]);
+}
+
+function buildPayload(document, range, contextLines) {
+  const startLine = range.start.line;
+  const endLine = Math.max(startLine, range.end.line);
+  const lines = providers.collectContextLines(document, startLine, endLine, contextLines);
+  return {
+    relativePath: vscode.workspace.asRelativePath(document.uri, false),
+    languageId: document.languageId,
+    range: { startLine: startLine + 1, endLine: endLine + 1 },
+    context: { lines }
+  };
+}
+
+function createTurn(prompt) {
+  return { id: crypto.randomUUID(), prompt, answer: '', status: 'pending', error: '', provider: '', model: '', startedAt: 0, finishedAt: 0, usage: null };
+}
+
+async function askFollowUp(entry, prompt) {
+  if (entry.turns.some(turn => isBusy(turn))) {
+    vscode.window.showInformationMessage('PReview: wait for the current answer to finish.');
+    return;
+  }
+  const turn = createTurn(prompt);
+  entry.turns.push(turn);
+  showPanel(false);
+  await runTurn(entry, turn);
+}
+
+function isBusy(turn) {
+  return turn.status === 'pending' || turn.status === 'streaming';
+}
+
+// ------------------------------------------------------------------ run
+
+async function runTurn(entry, turn, providerOverride) {
+  const settings = getSettings();
+  const provider = providerOverride || settings.provider;
+  const turnIndex = entry.turns.indexOf(turn);
+  const requestKey = `${entry.id}:${turn.id}`;
+
+  Object.assign(turn, {
+    answer: '',
+    error: '',
     status: 'pending',
-    composerText: '',
-    followUps: []
+    provider,
+    model: provider === 'anthropic' ? settings.anthropicModel : settings.ollamaModel,
+    startedAt: Date.now(),
+    finishedAt: 0,
+    usage: null
+  });
+  postEntry(entry);
+  syncThread(entry);
+
+  const abort = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abort.abort();
+  }, REQUEST_TIMEOUT_MS);
+  activeRequests.set(requestKey, abort);
+  updateStatusBar();
+
+  const onText = text => {
+    if (turn.status === 'pending') {
+      turn.status = 'streaming';
+      postEntry(entry);
+    }
+    turn.answer += text;
+    post({ type: 'chunk', entryId: entry.id, turnId: turn.id, text });
   };
 
-  previewEntries.push(entry);
-  return entry;
-}
+  try {
+    const { system, messages } = providers.buildMessages(entry, turnIndex);
+    log(`${provider} request (${turn.model}) for ${entry.payload.relativePath}:${entry.payload.range.startLine}`);
 
-function showSubmissionPreview(outputChannel) {
-  if (!previewPanel) {
-    previewPanel = vscode.window.createWebviewPanel(
-      'reviewCommentsPreview',
-      'AI Review Result',
-      vscode.ViewColumn.Beside,
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true
+    let result;
+    if (provider === 'anthropic') {
+      const apiKey = await getAnthropicKey({ prompt: true });
+      if (!apiKey) {
+        throw new Error('No Claude API key set. Run "PReview: Set Claude API Key".');
       }
-    );
+      result = await providers.streamAnthropic({
+        apiKey,
+        model: settings.anthropicModel,
+        effort: settings.anthropicEffort,
+        system,
+        messages,
+        signal: abort.signal,
+        onText
+      });
+    } else {
+      result = await providers.streamOllama({
+        url: settings.ollamaUrl,
+        model: settings.ollamaModel,
+        system,
+        messages,
+        signal: abort.signal,
+        onText
+      });
+    }
 
-    previewPanel.onDidDispose(() => {
-      abortActiveRequests();
-      previewPanel = undefined;
-      previewEntries = [];
-      webviewReady = false;
-      resolveWebviewReady = null;
-    });
-
-    webviewReady = false;
-    resolveWebviewReady = null;
-
-    previewPanel.webview.onDidReceiveMessage(async message => {
-      if (message?.type === 'webview-ready') {
-        webviewReady = true;
-        if (resolveWebviewReady) {
-          resolveWebviewReady();
-          resolveWebviewReady = null;
-        }
-        return;
-      }
-      await handleWebviewMessage(message, outputChannel);
-    });
-
-    renderPreviewPanel();
-  } else {
-    previewPanel.reveal(vscode.ViewColumn.Beside);
+    turn.answer = result.text;
+    turn.model = result.model || turn.model;
+    turn.usage = result.usage || null;
+    turn.status = result.text.trim() ? 'done' : 'error';
+    turn.error = result.text.trim() ? '' : 'The model returned an empty answer.';
+  } catch (error) {
+    turn.status = 'error';
+    if (error?.name === 'AbortError') {
+      turn.error = timedOut ? `Timed out after ${REQUEST_TIMEOUT_MS / 1000}s.` : 'Cancelled.';
+      turn.status = timedOut ? 'error' : 'cancelled';
+    } else {
+      turn.error = error.message;
+    }
+    log(`${provider} request failed: ${turn.error}`);
+  } finally {
+    clearTimeout(timer);
+    activeRequests.delete(requestKey);
+    turn.finishedAt = Date.now();
+    updateStatusBar();
   }
 
-  return previewPanel;
+  postEntry(entry);
+  syncThread(entry);
 }
 
-function waitForWebviewReady() {
-  if (webviewReady) {
-    return Promise.resolve();
-  }
+// ------------------------------------------------------------------ comment thread
 
-  return new Promise(resolve => {
-    const timer = setTimeout(() => {
-      resolveWebviewReady = null;
-      resolve();
-    }, 5000);
-
-    resolveWebviewReady = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-  });
-}
-
-function renderPreviewPanel() {
-  if (!previewPanel) {
+function syncThread(entry) {
+  const thread = entry.thread;
+  if (!thread || !getSettings().replyInThread) {
     return;
   }
 
-  const entriesHtml = previewEntries.map(entry => renderEntryHtml(entry)).join('\n');
+  const comments = [];
+  entry.turns.forEach((turn, index) => {
+    if (index > 0 || entry.hasUserComment) {
+      comments.push({
+        body: new vscode.MarkdownString(turn.prompt),
+        mode: vscode.CommentMode.Preview,
+        author: { name: 'You' },
+        contextValue: 'preview-user'
+      });
+    }
 
-  previewPanel.webview.html = `<!doctype html>
+    let body;
+    if (isBusy(turn)) {
+      body = '$(loading~spin) _Thinking… the answer streams into the PReview panel._';
+    } else if (turn.status === 'done') {
+      body = turn.answer;
+    } else {
+      body = `$(error) ${turn.error || 'Failed.'}`;
+    }
+    const markdown = new vscode.MarkdownString(body, true);
+    comments.push({
+      body: markdown,
+      mode: vscode.CommentMode.Preview,
+      author: { name: `${AI_AUTHOR} · ${turn.provider === 'anthropic' ? 'Claude' : 'Ollama'}` },
+      label: turn.model,
+      contextValue: 'preview-ai'
+    });
+  });
+
+  try {
+    thread.comments = comments;
+    thread.state = vscode.CommentThreadState?.Unresolved ?? thread.state;
+  } catch (error) {
+    log(`could not update comment thread: ${error.message}`);
+  }
+}
+
+function removeThread(thread) {
+  const entryId = thread && threadToEntry.get(thread);
+  if (entryId) {
+    removeEntry(entryId);
+  } else {
+    thread?.dispose?.();
+  }
+}
+
+function removeEntry(entryId) {
+  const entry = entries.find(item => item.id === entryId);
+  if (!entry) {
+    return;
+  }
+  for (const turn of entry.turns) {
+    activeRequests.get(`${entry.id}:${turn.id}`)?.abort();
+  }
+  entries = entries.filter(item => item !== entry);
+  try {
+    entry.thread?.dispose();
+  } catch {
+    // Thread may already be disposed.
+  }
+  post({ type: 'removed', entryId });
+}
+
+// ------------------------------------------------------------------ webview
+
+function showPanel(focus) {
+  if (panel) {
+    if (focus) {
+      panel.reveal(vscode.ViewColumn.Beside);
+    } else if (!panel.visible) {
+      panel.reveal(vscode.ViewColumn.Beside, true);
+    }
+    return panel;
+  }
+
+  const mediaRoot = vscode.Uri.joinPath(host.context.extensionUri, 'media');
+  panel = vscode.window.createWebviewPanel(
+    'reviewCommentsPreview',
+    'PReview',
+    { viewColumn: vscode.ViewColumn.Beside, preserveFocus: !focus },
+    { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [mediaRoot] }
+  );
+  panel.iconPath = vscode.Uri.joinPath(mediaRoot, 'icon.svg');
+  panel.webview.html = renderShell(panel.webview, mediaRoot);
+  panel.webview.onDidReceiveMessage(message => handleWebviewMessage(message).catch(error => {
+    log(`webview message failed: ${error.stack || error.message}`);
+  }));
+  panel.onDidDispose(() => {
+    // Entries (and in-flight requests) outlive the panel; their answers still
+    // land in the comment threads and reappear when the panel is reopened.
+    panel = undefined;
+  });
+  return panel;
+}
+
+function renderShell(webview, mediaRoot) {
+  const nonce = crypto.randomBytes(16).toString('base64');
+  const css = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'preview.css'));
+  const js = webview.asWebviewUri(vscode.Uri.joinPath(mediaRoot, 'preview.js'));
+  return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Review Submission</title>
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${previewPanel.webview.cspSource}; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
-  <style>
-    :root {
-      color-scheme: dark;
-      --bg: #0b0c0a;
-      --surface: #11130f;
-      --surface-raised: #171a15;
-      --line: #30352d;
-      --line-strong: #4a5345;
-      --text: #e8eee4;
-      --muted: #899287;
-      --faint: #596157;
-      --signal: #c6ff4a;
-      --signal-dim: rgba(198, 255, 74, 0.12);
-      --cyan: #7dd3fc;
-      --danger: #ff6b6b;
-    }
-    * { box-sizing: border-box; }
-    body {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
-      margin: 0;
-      padding: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-size: 13px;
-      line-height: 1.55;
-    }
-    button, textarea { font: inherit; }
-    button:focus-visible, textarea:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
-    .shell-header {
-      display: flex;
-      align-items: baseline;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 18px 20px 16px;
-      border-bottom: 1px solid var(--line);
-      background: var(--surface);
-    }
-    .eyebrow {
-      margin: 0;
-      color: var(--signal);
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: .12em;
-      text-transform: uppercase;
-    }
-    .shell-title { margin: 4px 0 0; font-size: 16px; letter-spacing: -.03em; }
-    .shell-count { color: var(--muted); font-size: 11px; white-space: nowrap; }
-    #entries { padding: 20px; max-width: 980px; margin: 0 auto; }
-    .empty-state {
-      border: 1px dashed var(--line-strong);
-      padding: 28px;
-      color: var(--muted);
-      text-align: center;
-    }
-    .empty-state h1 { margin: 0 0 6px; color: var(--text); font-size: 15px; }
-    .empty-state p { margin: 0; }
-    .section { margin-bottom: 18px; }
-    .card {
-      border: 1px solid var(--line);
-      background: var(--surface);
-      box-shadow: 0 10px 30px rgba(0, 0, 0, .18);
-    }
-    .card-top {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line);
-    }
-    .entry-index { color: var(--faint); font-size: 11px; }
-    .entry-title { margin: 3px 0 0; font-size: 14px; font-weight: 700; }
-    .source-strip {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 12px 20px;
-      padding: 13px 18px;
-      border-bottom: 1px solid var(--line);
-      background: #0e100d;
-    }
-    .source-label { color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: .1em; }
-    .source-value { display: block; margin-top: 3px; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
-    .source-value strong { color: var(--text); font-weight: 500; }
-    .answer-block { padding: 18px; }
-    .block-label { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; color: var(--faint); font-size: 10px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
-    pre {
-      margin: 0;
-      min-height: 96px;
-      max-height: 520px;
-      overflow: auto;
-      padding: 16px;
-      border: 1px solid var(--line);
-      background: #0b0d0a;
-      color: var(--text);
-      white-space: pre-wrap;
-      word-break: break-word;
-      tab-size: 2;
-    }
-    .context-details { border-bottom: 1px solid var(--line); }
-    .context-details summary { padding: 11px 18px; color: var(--muted); cursor: pointer; font-size: 11px; }
-    .context-details summary:hover { color: var(--signal); }
-    .context-details pre { max-height: 360px; border: 0; border-top: 1px solid var(--line); }
-    .markdown { min-height: 96px; overflow: auto; padding: 16px; border: 1px solid var(--line); background: #0b0d0a; color: var(--text); word-break: break-word; }
-    .markdown p { margin: 0 0 12px; }
-    .markdown p:last-child { margin-bottom: 0; }
-    .markdown h1, .markdown h2, .markdown h3 { margin: 0 0 10px; color: var(--signal); font-size: 13px; }
-    .markdown ul, .markdown ol { margin: 0 0 12px; padding-left: 22px; }
-    .markdown li + li { margin-top: 5px; }
-    .markdown code { padding: 1px 4px; background: var(--surface-raised); color: var(--signal); }
-    .markdown pre { margin: 10px 0 12px; min-height: 0; border-color: var(--line-strong); }
-    .markdown a { color: var(--cyan); }
-    .status {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: .08em;
-      text-transform: uppercase;
-    }
-    .status::after {
-      content: '';
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      background: currentColor;
-    }
-    .status-pending { color: #ffb74d; animation: pulse 1.4s ease-in-out infinite; }
-    .status-streaming { color: var(--cyan); }
-    .status-streaming::after { animation: blink 1s steps(2, start) infinite; }
-    .status-done { color: var(--signal); }
-    .status-error { color: var(--danger); }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
-    @keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: .15; } }
-    .follow-up-section { padding: 0 18px 18px; }
-    .follow-up-list {
-      display: grid;
-      gap: 16px;
-      margin-bottom: 16px;
-    }
-    .follow-up-item {
-      border-top: 1px solid var(--line);
-      padding-top: 16px;
-    }
-    .follow-up-item-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
-    .follow-up-prompt { margin: 0 0 8px; color: var(--muted); }
-    .follow-up-prompt strong { color: var(--text); font-weight: 500; }
-    .follow-up-output { min-height: 56px; }
-    .composer-label { margin: 0 0 7px; color: var(--faint); font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }
-    .follow-up-composer {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 10px;
-    }
-    .follow-up-input {
-      width: 100%;
-      min-height: 86px;
-      resize: vertical;
-      border: 1px solid var(--line-strong);
-      border-radius: 0;
-      background: #0b0d0a;
-      color: var(--text);
-      padding: 12px;
-      font: inherit;
-    }
-    .follow-up-input::placeholder { color: var(--faint); }
-    .follow-up-input:focus { border-color: var(--signal); outline: none; }
-    .send-btn {
-      align-self: stretch;
-      min-width: 88px;
-      background: var(--signal);
-      color: #10130c;
-      border: 1px solid var(--signal);
-      border-radius: 0;
-      padding: 12px 16px;
-      font: inherit;
-      font-weight: 700;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    .send-btn:hover:not(:disabled) { background: #e0ff9d; }
-    .send-btn:disabled { border-color: var(--line); background: var(--line); color: var(--faint); cursor: default; }
-    .copy-btn {
-      background: transparent;
-      border: 1px solid var(--line-strong);
-      color: var(--muted);
-      border-radius: 0;
-      padding: 4px 9px;
-      font: inherit;
-      font-size: 10px;
-      text-transform: uppercase;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    .copy-btn:hover:not(:disabled) { color: var(--signal); border-color: var(--signal); }
-    .copy-btn.copied { color: var(--signal); border-color: var(--signal); }
-    .copy-btn:disabled { color: var(--faint); border-color: var(--line); cursor: default; }
-    .action-btn { margin-left: 6px; }
-    .retry-btn { color: var(--signal); border-color: rgba(198, 255, 74, .45); }
-    .cancel-btn { color: #ffb74d; border-color: rgba(255, 183, 77, .45); }
-    .review-output.error, .follow-up-output.error { color: var(--danger); border-color: rgba(255, 107, 107, .45); }
-    @media (max-width: 560px) {
-      #entries { padding: 12px; }
-      .shell-header { padding: 14px 12px; }
-      .card-top, .source-strip, .answer-block, .follow-up-section { padding-left: 12px; padding-right: 12px; }
-      .source-strip, .follow-up-composer { grid-template-columns: 1fr; }
-      .send-btn { min-height: 44px; }
-    }
-  </style>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource}; font-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
+  <link rel="stylesheet" href="${css}">
+  <title>PReview</title>
 </head>
 <body>
-  <header class="shell-header">
-    <div><p class="eyebrow">PReview / local inference</p><h1 class="shell-title">Review results</h1></div>
-    <span class="shell-count">${previewEntries.length} submission${previewEntries.length === 1 ? '' : 's'}</span>
-  </header>
-  <div id="entries">
-    ${entriesHtml || '<div id="empty-state" class="empty-state"><h1>No submissions yet</h1><p>Send a comment from the editor to start a review.</p></div>'}
-  </div>
-  <script>
-    const vscode = acquireVsCodeApi();
-    const outputById = new Map();
-    const followUpOutputById = new Map();
-    const pendingEntries = new Set();
-    const savedTextareas = (vscode.getState() && vscode.getState().textareas) || {};
-
-    window.addEventListener('error', event => {
-      vscode.postMessage({
-        type: 'webview-error',
-        message: String(event.message || event.error || 'unknown error'),
-        line: event.lineno
-      });
-    });
-
-    window.addEventListener('unhandledrejection', event => {
-      vscode.postMessage({
-        type: 'webview-error',
-        message: 'unhandled rejection: ' + String(event.reason)
-      });
-    });
-
-    function getOutputElement(id) {
-      const cached = outputById.get(id);
-      if (!cached || !cached.isConnected) {
-        outputById.set(id, document.getElementById('review-output-' + id));
-      }
-
-      return outputById.get(id);
-    }
-
-    function getFollowUpOutputElement(entryId, followUpId) {
-      const key = entryId + ':' + followUpId;
-      const cached = followUpOutputById.get(key);
-
-      if (!cached || !cached.isConnected) {
-        followUpOutputById.set(key, document.getElementById('follow-up-output-' + entryId + '-' + followUpId));
-      }
-
-      return followUpOutputById.get(key);
-    }
-
-    function escapeMarkup(value) {
-      return String(value ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-    }
-
-    function inlineMarkdown(value) {
-      return escapeMarkup(value)
-        .replace(/\`([^\`]+)\`/g, '<code>$1</code>')
-        .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
-        .replace(/\\*([^*]+)\\*/g, '<em>$1</em>')
-        .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^\\s)]+)\\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
-    }
-
-    function renderMarkdown(value) {
-      const lines = String(value ?? '').replace(/\\r\\n/g, '\\n').split('\\n');
-      const html = [];
-      let paragraph = [];
-      let listType = '';
-      let listItems = [];
-      let codeLines = null;
-
-      function flushParagraph() {
-        if (paragraph.length) {
-          html.push('<p>' + inlineMarkdown(paragraph.join(' ')) + '</p>');
-          paragraph = [];
-        }
-      }
-
-      function flushList() {
-        if (!listItems.length) {
-          return;
-        }
-        html.push('<' + listType + '>' + listItems.map(item => '<li>' + inlineMarkdown(item) + '</li>').join('') + '</' + listType + '>');
-        listItems = [];
-        listType = '';
-      }
-
-      function flushCode() {
-        if (codeLines !== null) {
-          html.push('<pre><code>' + escapeMarkup(codeLines.join('\\n')) + '</code></pre>');
-          codeLines = null;
-        }
-      }
-
-      for (const line of lines) {
-        if (codeLines !== null) {
-          if (/^\`\`\`/.test(line)) {
-            flushCode();
-          } else {
-            codeLines.push(line);
-          }
-          continue;
-        }
-
-        if (/^\`\`\`/.test(line)) {
-          flushParagraph();
-          flushList();
-          codeLines = [];
-          continue;
-        }
-
-        const heading = line.match(/^(#{1,3})\\s+(.+)$/);
-        const bullet = line.match(/^\\s*[-*]\\s+(.+)$/);
-        const ordered = line.match(/^\\s*\\d+\\.\\s+(.+)$/);
-
-        if (!line.trim()) {
-          flushParagraph();
-          flushList();
-        } else if (heading) {
-          flushParagraph();
-          flushList();
-          const level = heading[1].length;
-          html.push('<h' + level + '>' + inlineMarkdown(heading[2]) + '</h' + level + '>');
-        } else if (bullet || ordered) {
-          flushParagraph();
-          const nextType = bullet ? 'ul' : 'ol';
-          if (listType && listType !== nextType) {
-            flushList();
-          }
-          listType = nextType;
-          listItems.push((bullet || ordered)[1]);
-        } else {
-          flushList();
-          paragraph.push(line.trim());
-        }
-      }
-
-      flushCode();
-      flushParagraph();
-      flushList();
-      return html.join('') || '<p class="muted-output">No response received.</p>';
-    }
-
-    function renderMarkdownBlock(element) {
-      if (!element) {
-        return;
-      }
-      const raw = element.dataset.raw ?? element.textContent;
-      element.dataset.raw = raw;
-      element.innerHTML = renderMarkdown(raw);
-    }
-
-    function appendMarkdown(element, chunk) {
-      if (!element) {
-        return;
-      }
-      const raw = (element.dataset.raw || '') + chunk;
-      element.dataset.raw = raw;
-      element.innerHTML = renderMarkdown(raw);
-    }
-
-    function setMarkdown(element, value, isError) {
-      if (!element) {
-        return;
-      }
-      element.dataset.raw = value || 'No response received.';
-      element.innerHTML = renderMarkdown(element.dataset.raw);
-      element.classList.toggle('error', Boolean(isError));
-    }
-
-    function renderMarkdownBlocks(root) {
-      (root || document).querySelectorAll('.markdown').forEach(renderMarkdownBlock);
-    }
-
-    function statusLabel(status) {
-      if (status === 'pending') {
-        return 'Queued';
-      }
-
-      if (status === 'streaming') {
-        return 'Generating';
-      }
-
-      if (status === 'error') {
-        return 'Failed';
-      }
-
-      return 'Done';
-    }
-
-    function setStatus(entryId, status) {
-      const el = document.getElementById('status-' + entryId);
-      if (el) {
-        el.className = 'status status-' + status;
-        el.textContent = statusLabel(status);
-      }
-    }
-
-    function setFollowUpStatus(entryId, followUpId, status) {
-      const el = document.getElementById('fu-status-' + entryId + '-' + followUpId);
-      if (el) {
-        el.className = 'status status-' + status;
-        el.textContent = statusLabel(status);
-      }
-    }
-
-    function flashCopied(button) {
-      if (!button) {
-        return;
-      }
-
-      const original = button.textContent;
-      button.textContent = 'Copied';
-      button.classList.add('copied');
-      setTimeout(() => {
-        button.textContent = original;
-        button.classList.remove('copied');
-      }, 1500);
-    }
-
-    function updateSendButton(entryId) {
-      const input = document.getElementById('follow-up-input-' + entryId);
-      const button = document.getElementById('send-btn-' + entryId);
-
-      if (!input || !button) {
-        return;
-      }
-
-      button.disabled = pendingEntries.has(entryId) || input.value.trim() === '';
-    }
-
-    function updateSubmissionCount() {
-      const count = document.querySelector('.shell-count');
-      const total = document.querySelectorAll('.card').length;
-      if (count) {
-        count.textContent = total + (total === 1 ? ' submission' : ' submissions');
-      }
-    }
-
-    function ensureFollowUpItem(entryId, followUpId, prompt) {
-      const container = document.getElementById('follow-up-list-' + entryId);
-
-      if (!container || document.getElementById('follow-up-' + entryId + '-' + followUpId)) {
-        return;
-      }
-
-      const item = document.createElement('div');
-      item.className = 'follow-up-item';
-      item.id = 'follow-up-' + entryId + '-' + followUpId;
-
-      const header = document.createElement('div');
-      header.className = 'follow-up-item-header';
-
-      const statusNode = document.createElement('span');
-      statusNode.className = 'status status-pending';
-      statusNode.id = 'fu-status-' + entryId + '-' + followUpId;
-      statusNode.textContent = statusLabel('pending');
-
-      const copyNode = document.createElement('button');
-      copyNode.className = 'copy-btn action-btn cancel-btn';
-      copyNode.dataset.entryId = entryId;
-      copyNode.dataset.followUpId = followUpId;
-      copyNode.textContent = 'Cancel';
-
-      header.appendChild(statusNode);
-      header.appendChild(copyNode);
-
-      const promptNode = document.createElement('p');
-      promptNode.className = 'follow-up-prompt';
-      promptNode.textContent = 'Follow-up: ' + prompt;
-
-      const outputNode = document.createElement('div');
-      outputNode.className = 'markdown follow-up-output';
-      outputNode.id = 'follow-up-output-' + entryId + '-' + followUpId;
-
-      item.appendChild(header);
-      item.appendChild(promptNode);
-      item.appendChild(outputNode);
-      container.appendChild(item);
-    }
-
-    function persistTextarea(entryId, value) {
-      savedTextareas[entryId] = value;
-      vscode.setState({ textareas: savedTextareas });
-    }
-
-    function sendFollowUp(entryId) {
-      if (pendingEntries.has(entryId)) {
-        return;
-      }
-
-      const input = document.getElementById('follow-up-input-' + entryId);
-
-      if (!input) {
-        return;
-      }
-
-      const prompt = input.value.trim();
-      if (!prompt) {
-        return;
-      }
-
-      pendingEntries.add(entryId);
-      updateSendButton(entryId);
-      vscode.postMessage({
-        type: 'send-follow-up',
-        entryId,
-        prompt
-      });
-
-      input.value = '';
-      persistTextarea(entryId, '');
-      vscode.postMessage({ type: 'composer-change', entryId, value: '' });
-      updateSendButton(entryId);
-    }
-
-    function copySelector(message) {
-      return message.followUpId
-        ? '[data-copy-entry="' + message.entryId + '"][data-copy-follow-up="' + message.followUpId + '"]'
-        : '[data-copy-entry="' + message.entryId + '"]';
-    }
-
-    document.addEventListener('keydown', event => {
-      const input = event.target.closest('.follow-up-input');
-      if (!input || event.key !== 'Enter') {
-        return;
-      }
-
-      if (event.isComposing) {
-        return;
-      }
-
-      if (event.shiftKey || event.metaKey) {
-        event.preventDefault();
-        const start = input.selectionStart ?? input.value.length;
-        const end = input.selectionEnd ?? input.value.length;
-        input.value = input.value.slice(0, start) + '\\n' + input.value.slice(end);
-        input.selectionStart = input.selectionEnd = start + 1;
-        updateSendButton(input.dataset.entryId);
-        persistTextarea(input.dataset.entryId, input.value);
-        vscode.postMessage({ type: 'composer-change', entryId: input.dataset.entryId, value: input.value });
-        return;
-      }
-
-      event.preventDefault();
-      sendFollowUp(input.dataset.entryId);
-    });
-
-    document.addEventListener('input', event => {
-      const input = event.target.closest('.follow-up-input');
-      if (input && input.dataset.entryId) {
-        updateSendButton(input.dataset.entryId);
-        persistTextarea(input.dataset.entryId, input.value);
-        vscode.postMessage({ type: 'composer-change', entryId: input.dataset.entryId, value: input.value });
-      }
-    });
-
-    document.addEventListener('keyup', event => {
-      const input = event.target.closest('.follow-up-input');
-      if (input && input.dataset.entryId) {
-        updateSendButton(input.dataset.entryId);
-        persistTextarea(input.dataset.entryId, input.value);
-        vscode.postMessage({ type: 'composer-change', entryId: input.dataset.entryId, value: input.value });
-      }
-    });
-
-    document.addEventListener('click', event => {
-      const sendButton = event.target.closest('.send-btn');
-      if (sendButton && sendButton.dataset.entryId) {
-        sendFollowUp(sendButton.dataset.entryId);
-        return;
-      }
-
-      const retryButton = event.target.closest('.retry-btn');
-      if (retryButton && retryButton.dataset.entryId) {
-        vscode.postMessage({ type: 'retry-review', entryId: retryButton.dataset.entryId });
-        return;
-      }
-
-      const cancelButton = event.target.closest('.cancel-btn');
-      if (cancelButton && cancelButton.dataset.entryId) {
-        vscode.postMessage({
-          type: cancelButton.dataset.followUpId ? 'cancel-follow-up' : 'cancel-review',
-          entryId: cancelButton.dataset.entryId,
-          followUpId: cancelButton.dataset.followUpId
-        });
-        return;
-      }
-
-      const copyButton = event.target.closest('.copy-btn');
-      if (copyButton) {
-        vscode.postMessage({
-          type: 'copy-review',
-          entryId: copyButton.dataset.copyEntry,
-          followUpId: copyButton.dataset.copyFollowUp
-        });
-      }
-    });
-
-    window.addEventListener('message', event => {
-      const message = event.data;
-      if (!message || message.type === undefined) {
-        return;
-      }
-
-      if (message.type === 'entry-added') {
-        const container = document.getElementById('entries');
-        if (container) {
-          const emptyState = document.getElementById('empty-state');
-          if (emptyState) {
-            emptyState.remove();
-          }
-          container.insertAdjacentHTML('beforeend', message.html);
-          renderMarkdownBlocks(container.lastElementChild);
-          updateSubmissionCount();
-        }
-      }
-
-      if (message.type === 'entry-updated') {
-        const current = document.querySelector('[data-entry-id="' + message.id + '"]');
-        if (current) {
-          const input = current.querySelector('.follow-up-input');
-          const hadFocus = document.activeElement === input;
-          const value = input ? input.value : '';
-          current.outerHTML = message.html;
-          const replacement = document.getElementById('follow-up-input-' + message.id);
-          if (replacement && value && !replacement.value) {
-            replacement.value = value;
-          }
-          if (hadFocus && replacement) {
-            replacement.focus();
-            replacement.selectionStart = replacement.selectionEnd = replacement.value.length;
-          }
-          renderMarkdownBlocks(current.parentElement || document);
-          pendingEntries.delete(message.id);
-          updateSendButton(message.id);
-        }
-      }
-
-      if (message.type === 'review-streaming') {
-        setStatus(message.id, 'streaming');
-      }
-
-      if (message.type === 'review-chunk') {
-        const reviewOutput = getOutputElement(message.id);
-        if (reviewOutput) {
-          appendMarkdown(reviewOutput, message.chunk);
-        }
-        setStatus(message.id, 'streaming');
-      }
-
-      if (message.type === 'review-final') {
-        const reviewOutput = getOutputElement(message.id);
-        if (reviewOutput) {
-          setMarkdown(reviewOutput, message.review, message.status === 'error');
-        }
-        setStatus(message.id, message.status || 'done');
-      }
-
-      if (message.type === 'follow-up-pending') {
-        ensureFollowUpItem(message.entryId, message.followUpId, message.prompt);
-      }
-
-      if (message.type === 'follow-up-streaming') {
-        setFollowUpStatus(message.entryId, message.followUpId, 'streaming');
-      }
-
-      if (message.type === 'follow-up-chunk') {
-        const followUpOutput = getFollowUpOutputElement(message.entryId, message.followUpId);
-        if (followUpOutput) {
-          appendMarkdown(followUpOutput, message.chunk);
-        }
-        setFollowUpStatus(message.entryId, message.followUpId, 'streaming');
-      }
-
-      if (message.type === 'follow-up-final') {
-        const followUpOutput = getFollowUpOutputElement(message.entryId, message.followUpId);
-        if (followUpOutput) {
-          setMarkdown(followUpOutput, message.review, message.status === 'error');
-        }
-        setFollowUpStatus(message.entryId, message.followUpId, message.status || 'done');
-        const copyButton = document.querySelector(copySelector({
-          entryId: message.entryId,
-          followUpId: message.followUpId
-        }));
-        if (copyButton) {
-          copyButton.disabled = false;
-        }
-        pendingEntries.delete(message.entryId);
-        updateSendButton(message.entryId);
-      }
-
-      if (message.type === 'copy-done') {
-        flashCopied(document.querySelector(copySelector(message)));
-      }
-    });
-
-    document.querySelectorAll('.follow-up-input').forEach(input => {
-      const entryId = input.dataset.entryId;
-      if (entryId && typeof savedTextareas[entryId] === 'string') {
-        input.value = savedTextareas[entryId];
-      }
-      updateSendButton(entryId);
-    });
-
-    renderMarkdownBlocks();
-
-    vscode.postMessage({ type: 'webview-ready' });
-  </script>
+  <div id="app"></div>
+  <script nonce="${nonce}" src="${js}"></script>
 </body>
 </html>`;
 }
 
-function statusLabel(status) {
-  if (status === 'pending') {
-    return 'Queued';
-  }
-
-  if (status === 'streaming') {
-    return 'Generating';
-  }
-
-  if (status === 'error') {
-    return 'Failed';
-  }
-
-  return 'Done';
-}
-
-function renderEntryHtml(entry) {
-  const followUpHtml = entry.followUps.map(followUp => renderFollowUpHtml(entry.id, followUp)).join('\n');
-  const status = entry.status || 'done';
-  const inFlight = status === 'pending' || status === 'streaming';
-  const sendDisabled = !(entry.composerText || '').trim() ? ' disabled' : '';
-  const context = [
-    ...(entry.payload.surroundingContext?.before ?? []),
-    '--- selected ---',
-    ...(entry.payload.surroundingContext?.selected ?? []),
-    '--- after ---',
-    ...(entry.payload.surroundingContext?.after ?? [])
-  ].join('\n');
-
-  return `
-    <article class="section card" data-entry-id="${escapeHtml(entry.id)}">
-      <div class="card-top">
-        <div>
-          <div class="entry-index">LINE ${escapeHtml(entry.lineNumber)}</div>
-          <h2 class="entry-title">${escapeHtml(entry.question)}</h2>
-        </div>
-        <div>
-          <span class="status status-${escapeHtml(status)}" id="status-${escapeHtml(entry.id)}">${escapeHtml(statusLabel(status))}</span>
-          ${inFlight
-            ? `<button class="copy-btn action-btn cancel-btn" data-entry-id="${escapeHtml(entry.id)}">Cancel</button>`
-            : status === 'error'
-              ? `<button class="copy-btn action-btn retry-btn" data-entry-id="${escapeHtml(entry.id)}">Retry</button>`
-              : `<button class="copy-btn action-btn" data-copy-entry="${escapeHtml(entry.id)}">Copy answer</button>`}
-        </div>
-      </div>
-      <div class="source-strip">
-        <div><span class="source-label">Selected line</span><span class="source-value"><strong>${escapeHtml(entry.lineNumber)}:</strong> ${escapeHtml(entry.lineText)}</span></div>
-        <div><span class="source-label">Model</span><span class="source-value">${escapeHtml(entry.model)}</span></div>
-      </div>
-      <details class="context-details">
-        <summary>Show code context</summary>
-        <pre>${escapeHtml(context)}</pre>
-      </details>
-      <section class="answer-block" aria-label="Review answer">
-        <div class="block-label"><span>Assistant answer</span><span>${escapeHtml(statusLabel(status))}</span></div>
-        <div class="markdown review-output${status === 'error' ? ' error' : ''}" id="review-output-${escapeHtml(entry.id)}">${escapeHtml(entry.review)}</div>
-      </section>
-      <section class="follow-up-section" aria-label="Follow-up questions">
-        <div class="follow-up-list" id="follow-up-list-${escapeHtml(entry.id)}">
-          ${followUpHtml}
-        </div>
-        <p class="composer-label">Continue this review</p>
-        <div class="follow-up-composer">
-          <textarea class="follow-up-input" id="follow-up-input-${escapeHtml(entry.id)}" data-entry-id="${escapeHtml(entry.id)}" rows="3" aria-label="Follow-up question" placeholder="Ask about the finding, request a fix, or ask for an explanation.">${escapeHtml(entry.composerText || '')}</textarea>
-          <button class="send-btn" id="send-btn-${escapeHtml(entry.id)}" data-entry-id="${escapeHtml(entry.id)}"${sendDisabled}>Send</button>
-        </div>
-        <p class="composer-label">Enter to send · Shift+Enter for a new line</p>
-      </section>
-    </article>
-  `;
-}
-
-function renderFollowUpHtml(entryId, followUp) {
-  const status = followUp.status || 'done';
-  const inFlight = status === 'pending' || status === 'streaming';
-
-  return `
-    <div class="follow-up-item" id="follow-up-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">
-      <div class="follow-up-item-header">
-        <span class="status status-${escapeHtml(status)}" id="fu-status-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">${escapeHtml(statusLabel(status))}</span>
-        ${inFlight
-          ? `<button class="copy-btn action-btn cancel-btn" data-entry-id="${escapeHtml(entryId)}" data-follow-up-id="${escapeHtml(followUp.id)}">Cancel</button>`
-          : `<button class="copy-btn action-btn" data-copy-entry="${escapeHtml(entryId)}" data-copy-follow-up="${escapeHtml(followUp.id)}">Copy answer</button>`}
-      </div>
-      <p class="follow-up-prompt"><strong>Follow-up:</strong> ${escapeHtml(followUp.prompt)}</p>
-      <div class="markdown follow-up-output${status === 'error' ? ' error' : ''}" id="follow-up-output-${escapeHtml(entryId)}-${escapeHtml(followUp.id)}">${escapeHtml(followUp.review)}</div>
-    </div>
-  `;
-}
-
-async function handleWebviewMessage(message, outputChannel) {
-  if (!message || !message.type) {
-    return;
-  }
-
-  if (message.type === 'webview-error') {
-    outputChannel.appendLine(`[review-comments] webview error: ${message.message}${message.line ? ` (line ${message.line})` : ''}`);
-    return;
-  }
-
-  if (message.type === 'composer-change') {
-    const entry = previewEntries.find(item => item.id === message.entryId);
-    if (entry) {
-      entry.composerText = typeof message.value === 'string' ? message.value : '';
-    }
-    return;
-  }
-
-  if (message.type === 'retry-review') {
-    const entry = previewEntries.find(item => item.id === message.entryId);
-    if (entry && entry.status === 'error') {
-      await runReview(entry, outputChannel, previewPanel);
-    }
-    return;
-  }
-
-  if (message.type === 'cancel-review') {
-    abortRequest(message.entryId);
-    return;
-  }
-
-  if (message.type === 'cancel-follow-up') {
-    abortRequest(`follow-up:${message.entryId}:${message.followUpId}`);
-    return;
-  }
-
-  if (message.type === 'send-follow-up') {
-    await handleFollowUp(message.entryId, message.prompt, outputChannel);
-    return;
-  }
-
-  if (message.type === 'copy-review') {
-    const entry = previewEntries.find(item => item.id === message.entryId);
-    const text = message.followUpId
-      ? entry?.followUps.find(followUp => followUp.id === message.followUpId)?.review ?? ''
-      : entry?.review ?? '';
-    if (!text) {
-      return;
-    }
-    await vscode.env.clipboard.writeText(text);
-    postToPanel(previewPanel, {
-      type: 'copy-done',
-      entryId: message.entryId,
-      followUpId: message.followUpId
-    });
-  }
-}
-
-async function handleFollowUp(entryId, prompt, outputChannel) {
-  try {
-    const entry = previewEntries.find(item => item.id === entryId);
-    if (!entry) {
-      return;
-    }
-
-    const followUp = {
-      id: crypto.randomUUID(),
-      prompt,
-      review: '',
-      status: 'pending'
-    };
-
-    entry.followUps.push(followUp);
-
-    postToPanel(previewPanel, {
-      type: 'follow-up-pending',
-      entryId,
-      followUpId: followUp.id,
-      prompt
-    });
-
-    followUp.requestKey = `follow-up:${entryId}:${followUp.id}`;
-    const review = await getOllamaFollowUpReview(entry, prompt, outputChannel, followUp.id);
-    followUp.review = review;
-    followUp.status = 'done';
-
-    postToPanel(previewPanel, {
-      type: 'entry-updated',
-      id: entry.id,
-      html: renderEntryHtml(entry)
-    });
-  } catch (error) {
-    const message = `[review-comments] follow-up failed: ${error.message}`;
-    console.error(message);
-    outputChannel.appendLine(message);
-    const latestFollowUp = previewEntries.find(item => item.id === entryId)?.followUps.slice(-1)[0];
-    if (latestFollowUp) {
-      latestFollowUp.status = 'error';
-    }
-    const entry = previewEntries.find(item => item.id === entryId);
-    if (entry) {
-      postToPanel(previewPanel, {
-        type: 'entry-updated',
-        id: entry.id,
-        html: renderEntryHtml(entry)
-      });
-    }
-  }
-}
-
-async function getOllamaReview(payload, outputChannel, ollamaSettings, panel, entryId) {
-  if (typeof fetch !== 'function') {
-    throw new Error('Fetch is not available in this VS Code runtime.');
-  }
-
-  const requestBody = buildOllamaRequestBody(payload, ollamaSettings.model);
-  const request = createRequestSignal(REQUEST_TIMEOUT_MS, entryId);
-
-  outputChannel.appendLine(`[review-comments] sending request to Ollama model ${ollamaSettings.model}`);
-
-  try {
-    const response = await fetch(ollamaSettings.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      signal: request.signal,
-      body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Ollama request failed (${response.status}): ${errorText}`);
-    }
-
-    return readOllamaStream(response, panel, entryId, 'review-chunk');
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      throw new Error(
-        request.isTimeout()
-          ? `Ollama request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
-          : 'Ollama request cancelled'
-      );
-    }
-    throw new Error(formatOllamaError(error, ollamaSettings.url));
-  } finally {
-    request.cleanup();
-  }
-}
-
-async function getOllamaFollowUpReview(entry, prompt, outputChannel, followUpId) {
-  if (typeof fetch !== 'function') {
-    throw new Error('Fetch is not available in this VS Code runtime.');
-  }
-
-  const ollamaSettings = getOllamaSettings();
-  const requestBody = buildFollowUpRequestBody(entry, prompt, ollamaSettings.model);
-  const request = createRequestSignal(REQUEST_TIMEOUT_MS, `follow-up:${entry.id}:${followUpId}`);
-
-  outputChannel.appendLine(`[review-comments] sending follow-up request to Ollama model ${ollamaSettings.model}`);
-
-  try {
-    const response = await fetch(ollamaSettings.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      signal: request.signal,
-      body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Ollama request failed (${response.status}): ${errorText}`);
-    }
-
-    return readOllamaStream(response, previewPanel, entry.id, 'follow-up-chunk', followUpId);
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      throw new Error(
-        request.isTimeout()
-          ? `Ollama request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
-          : 'Ollama request cancelled'
-      );
-    }
-    throw new Error(formatOllamaError(error, ollamaSettings.url));
-  } finally {
-    request.cleanup();
-  }
-}
-
-function formatOllamaError(error, url) {
-  const message = error?.message || String(error);
-
-  if (/fetch failed|failed to fetch|networkerror|connection refused/i.test(message)) {
-    return `Could not connect to Ollama at ${url}. Start Ollama with \`ollama serve\`, then confirm the reviewComments.ollamaUrl setting. (${message})`;
-  }
-
-  return message;
-}
-
-async function checkOllamaAvailability(url, model, requestKey) {
-  if (typeof fetch !== 'function') {
-    throw new Error('Fetch is not available in this VS Code runtime.');
-  }
-
-  const healthUrl = getOllamaHealthUrl(url);
-  const request = createRequestSignal(HEALTH_CHECK_TIMEOUT_MS, requestKey);
-
-  try {
-    const response = await fetch(healthUrl, {
-      method: 'GET',
-      signal: request.signal
-    });
-
-    if (!response.ok) {
-      throw new Error(`Ollama health check failed (${response.status})`);
-    }
-
-    const data = await response.json();
-    const models = Array.isArray(data?.models) ? data.models.map(item => item?.name).filter(Boolean) : [];
-    if (models.length > 0 && !models.includes(model)) {
-      throw new Error(`Ollama model "${model}" is not installed. Run \`ollama pull ${model}\`.`);
-    }
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      throw new Error(`Ollama did not respond within ${HEALTH_CHECK_TIMEOUT_MS / 1000}s`);
-    }
-    throw new Error(formatOllamaError(error, url));
-  } finally {
-    request.cleanup();
-  }
-}
-
-function getOllamaHealthUrl(url) {
-  try {
-    const parsed = new URL(url);
-    parsed.pathname = parsed.pathname.replace(/\/api\/chat\/?$/, '/api/tags');
-    return parsed.toString();
-  } catch {
-    return url;
-  }
-}
-
-function buildOllamaRequestBody(payload, model) {
-  return {
-    model,
-    stream: true,
-    messages: [
-      {
-        role: 'system',
-        content: 'You are a concise code assistant. Follow the user\'s comment text as the task, and respond with only the requested output. If the user asks to explain code, explain it plainly instead of reviewing it.'
-      },
-      {
-        role: 'user',
-        content: [
-          `Task from comment text: ${payload.commentText || 'Review this code.'}`,
-          'Use the selected code and surrounding context to answer the task directly.',
-          payload.commentText && /explain/i.test(payload.commentText)
-            ? 'Explain what the selected function does, step by step, in plain language.'
-            : 'If you find issues, return only the most important findings with a short fix for each.',
-          JSON.stringify(payload, null, 2)
-        ].join('\n\n')
-      }
-    ]
-  };
-}
-
-function buildFollowUpRequestBody(entry, prompt, model) {
-  return {
-    model,
-    stream: true,
-    messages: [
-      {
-        role: 'system',
-        content: 'You are a concise code assistant. Continue the conversation from the previous answer and respond directly to the follow-up question.'
-      },
-      {
-        role: 'user',
-        content: [
-          `Original question: ${entry.question}`,
-          `Selected line: ${entry.lineNumber}: ${entry.lineText}`,
-          `Previous answer: ${truncateForModel(entry.review, MAX_REVIEW_CONTEXT)}`,
-          `Follow-up question: ${prompt}`,
-          truncateForModel(JSON.stringify(entry.payload, null, 2), MAX_PAYLOAD_CONTEXT)
-        ].join('\n\n')
-      }
-    ]
-  };
-}
-
-async function readOllamaStream(response, panel, entryId, chunkType, followUpId) {
-  if (!response.body || typeof response.body.getReader !== 'function') {
-    const data = await response.json();
-    return data?.message?.content ?? '';
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buffer = '';
-  let review = '';
-  let started = false;
-
-  while (true) {
-    const { done, value } = await reader.read();
-
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-
-    let newlineIndex = buffer.indexOf('\n');
-    while (newlineIndex !== -1) {
-      const line = buffer.slice(0, newlineIndex).trim();
-      buffer = buffer.slice(newlineIndex + 1);
-      newlineIndex = buffer.indexOf('\n');
-
-      if (!line) {
-        continue;
-      }
-
-      const chunk = parseOllamaLine(line);
-      if (!chunk) {
-        continue;
-      }
-
-      review += chunk;
-      if (!started) {
-        started = true;
-        markStreaming(entryId, chunkType, followUpId);
-      }
-      if (!postToPanel(panel, {
-        type: chunkType,
-        id: entryId,
-        followUpId,
-        chunk
-      })) {
-        return review;
-      }
-    }
-  }
-
-  const trailing = buffer.trim();
-  if (trailing) {
-    const chunk = parseOllamaLine(trailing);
-    if (chunk) {
-      review += chunk;
-      if (!started) {
-        started = true;
-        markStreaming(entryId, chunkType, followUpId);
-      }
-      if (!postToPanel(panel, {
-        type: chunkType,
-        id: entryId,
-        followUpId,
-        chunk
-      })) {
-        return review;
-      }
-    }
-  }
-
-  return review;
-}
-
-function markStreaming(entryId, chunkType, followUpId) {
-  if (chunkType === 'review-chunk') {
-    const entry = previewEntries.find(item => item.id === entryId);
-    if (entry) {
-      entry.status = 'streaming';
-    }
-    postToPanel(previewPanel, {
-      type: 'review-streaming',
-      id: entryId
-    });
-    return;
-  }
-  const entry = previewEntries.find(item => item.id === entryId);
-  const followUp = entry?.followUps.find(followUp => followUp.id === followUpId);
-  if (followUp) {
-    followUp.status = 'streaming';
-  }
-  postToPanel(previewPanel, {
-    type: 'follow-up-streaming',
-    entryId,
-    followUpId
-  });
-}
-
-function parseOllamaLine(line) {
-  try {
-    const data = JSON.parse(line);
-    return data?.message?.content ?? '';
-  } catch {
-    return '';
-  }
-}
-
-function createRequestSignal(timeoutMs, requestKey) {
-  const controller = new AbortController();
-  let didTimeout = false;
-  activeRequests.add(controller);
-  if (requestKey) {
-    activeRequestsByKey.set(requestKey, controller);
-  }
-
-  const timer = setTimeout(() => {
-    didTimeout = true;
-    controller.abort();
-  }, timeoutMs);
-
-  return {
-    signal: controller.signal,
-    isTimeout: () => didTimeout,
-    cleanup() {
-      clearTimeout(timer);
-      activeRequests.delete(controller);
-      if (requestKey && activeRequestsByKey.get(requestKey) === controller) {
-        activeRequestsByKey.delete(requestKey);
-      }
-    }
-  };
-}
-
-function abortRequest(requestKey) {
-  const controller = activeRequestsByKey.get(requestKey);
-  if (controller) {
-    controller.abort();
-  }
-}
-
-function abortActiveRequests() {
-  for (const controller of activeRequests) {
-    controller.abort();
-  }
-  activeRequests.clear();
-  activeRequestsByKey.clear();
-}
-
-function postToPanel(panel, message) {
-  if (!panel || panel !== previewPanel || !panel.webview) {
+function post(message) {
+  if (!panel) {
     return false;
   }
-
   try {
     panel.webview.postMessage(message);
     return true;
@@ -1515,84 +498,127 @@ function postToPanel(panel, message) {
   }
 }
 
-function truncateForModel(text, maxChars) {
-  if (typeof text !== 'string' || text.length <= maxChars) {
-    return text;
-  }
-
-  return `${text.slice(0, maxChars)}\n...[truncated for model context]`;
+function postEntry(entry) {
+  post({ type: 'entry', entry: toView(entry) });
 }
 
-function getOllamaSettings() {
-  const config = vscode.workspace.getConfiguration('reviewComments');
+function postProviderInfo() {
+  post({ type: 'provider', provider: providerInfo() });
+}
 
+function toView(entry) {
   return {
-    url: config.get('ollamaUrl', OLLAMA_URL),
-    model: config.get('ollamaModel', OLLAMA_MODEL)
+    id: entry.id,
+    mode: entry.mode,
+    createdAt: entry.createdAt,
+    file: entry.payload.relativePath,
+    languageId: entry.payload.languageId,
+    range: entry.payload.range,
+    context: entry.payload.context.lines,
+    turns: entry.turns.map(turn => ({
+      id: turn.id,
+      prompt: turn.prompt,
+      answer: turn.answer,
+      status: turn.status,
+      error: turn.error,
+      provider: turn.provider,
+      model: turn.model,
+      startedAt: turn.startedAt,
+      finishedAt: turn.finishedAt,
+      usage: turn.usage
+    }))
   };
 }
 
-function collectContext(document, range, radius) {
-  const startLine = Math.max(0, range.start.line - radius);
-  const endLine = Math.min(document.lineCount - 1, range.end.line + radius);
-  const before = [];
-  const selected = [];
-  const after = [];
-
-  for (let line = startLine; line <= endLine; line += 1) {
-    const text = `${line + 1}: ${document.lineAt(line).text}`;
-    if (line < range.start.line) {
-      before.push(text);
-    } else if (line > range.end.line) {
-      after.push(text);
-    } else {
-      selected.push(text);
-    }
+async function handleWebviewMessage(message) {
+  if (!message?.type) {
+    return;
   }
+  const entry = message.entryId ? entries.find(item => item.id === message.entryId) : undefined;
+  const turn = entry && message.turnId ? entry.turns.find(item => item.id === message.turnId) : undefined;
 
-  return {
-    before,
-    selected,
-    after
-  };
+  switch (message.type) {
+    case 'ready':
+      post({ type: 'init', provider: providerInfo(), entries: entries.map(toView) });
+      return;
+    case 'webview-error':
+      log(`webview error: ${message.message}`);
+      return;
+    case 'follow-up':
+      if (entry && typeof message.prompt === 'string' && message.prompt.trim()) {
+        await askFollowUp(entry, message.prompt.trim());
+      }
+      return;
+    case 'retry':
+    case 'ask-claude':
+      if (entry && turn && !isBusy(turn)) {
+        if (message.type === 'ask-claude' && !(await getAnthropicKey({ prompt: true }))) {
+          return;
+        }
+        await runTurn(entry, turn, message.type === 'ask-claude' ? 'anthropic' : undefined);
+      }
+      return;
+    case 'cancel':
+      if (entry && turn) {
+        activeRequests.get(`${entry.id}:${turn.id}`)?.abort();
+      }
+      return;
+    case 'copy':
+      if (typeof message.text === 'string' && message.text) {
+        await vscode.env.clipboard.writeText(message.text);
+      } else if (turn?.answer) {
+        await vscode.env.clipboard.writeText(turn.answer);
+      }
+      return;
+    case 'reveal':
+      if (entry) {
+        await revealEntry(entry);
+      }
+      return;
+    case 'remove':
+      if (entry) {
+        removeEntry(entry.id);
+      }
+      return;
+    case 'clear':
+      for (const item of [...entries]) {
+        removeEntry(item.id);
+      }
+      return;
+    case 'select-provider':
+      await selectProvider();
+      return;
+    default:
+  }
 }
+
+async function revealEntry(entry) {
+  const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(entry.uri));
+  const editor = await vscode.window.showTextDocument(document, { viewColumn: vscode.ViewColumn.One, preserveFocus: false });
+  const start = entry.payload.range.startLine - 1;
+  const end = Math.min(document.lineCount - 1, entry.payload.range.endLine - 1);
+  const range = new vscode.Range(start, 0, end, document.lineAt(end).range.end.character);
+  editor.selection = new vscode.Selection(range.start, range.end);
+  editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+}
+
+// ------------------------------------------------------------------ helpers
 
 function normalizeText(value) {
   if (typeof value === 'string') {
     return value;
   }
-
   if (!value) {
     return '';
   }
-
   if (typeof value.value === 'string') {
     return value.value;
   }
-
   return String(value);
 }
-
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
-
-function deactivate() {}
 
 module.exports = {
   activate,
   deactivate,
-  buildOllamaRequestBody,
-  buildFollowUpRequestBody,
-  parseOllamaLine,
-  collectContext,
-  normalizeText,
-  escapeHtml,
-  truncateForModel,
-  formatOllamaError
+  normalizeText
 };
